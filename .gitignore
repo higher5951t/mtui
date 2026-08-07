@@ -1,0 +1,16 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+
+# mtui runtime state (created on first launch)
+.mtui/
+mtui_runtime/
+
+# Editors / OS
+.DS_Store
+*.swp
+.idea/
+.vscode/
