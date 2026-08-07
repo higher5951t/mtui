@@ -1,0 +1,2905 @@
+#!/usr/bin/env python3
+"""
+mtui — Bloomberg-Style Sovereign Rating Terminal (Paperflow GFCR v6.0)
+=============================================================================
+A dense, keyboard-driven financial terminal that reads `paperflow`'s SQLite
+databases (data/warehouse/paperflow.db + gfcr.db) directly and turns the
+GFCR v6.0 11-module sovereign rating engine into a Bloomberg-grade terminal:
+
+    ┌────────────────────────────────────────────────────────────────┐
+    │ MTUI  PAPERFLOW GFCR v6.0 │ MACRO MATRIX  14:22:31  DB:LIVE   │
+    ├───────────┬────────────────────────────────────────────────────┤
+    │ ◎DASHBOARD│  MACRO MATRIX — sorted by score ▾                 │
+    │ ◈MACRO M..│  ISO  COUNTRY      SCORE TIER S_EFF FISC EXT DYN  │
+    │ ⌖COUNTRY..│  USA  United State  78.4 AA   0.62  62%  45% 55%  │
+    │ ≡POLICY...│  DEU  Germany       74.1 AA   0.64  ...  ▁▂▃▄▆▇█ │
+    │ ⚠DATA AUD.│                                                 │
+    │ ⚙SYSTEM...│                                                 │
+    ├───────────┴────────────────────────────────────────────────────┤
+    │ » : commands · Ctrl+F search       14:21:03 open DEU · sort    │
+    │ ↑↓ nav · Enter act · Tab→ · 1..6 screens · / palette · q quit  │
+    └────────────────────────────────────────────────────────────────┘
+
+Design rules (Bloomberg aesthetics):
+  * Amber (yellow) headers on black, edge-to-edge, zero chrome.
+  * Bright cyan = interactive selector; green/red = positive/negative;
+    bright magenta = alerts; dense grids with box.SIMPLE outer frames
+    and box.NONE data tables; ASCII sparklines (▁▂▃▄▅▆▇█) everywhere.
+  * Everything is a number; everything is reachable by keyboard.
+
+Data integration (paperflow GFCR v6.0):
+  * Dashboard / Macro Matrix   — country_ratings_gfcr (40 cty, round 2026):
+      gfcr_score (0-100, higher = more capacity), s_eff and the module
+      risk scores (0-1, lower = better), plus 3-year score sparklines.
+  * Country Deep-Dive          — 11-module breakdown with mini risk bars,
+      90% credible interval (p05/p50/p95), 5-yr macro time series and the
+      LLM narrative when present.
+  * Policy Events              — policy_events × macro_indicators,
+      5 years before vs 5 years after each reform.
+  * Data Audit                 — data_audit provenance grid with an
+      estimated-only filter (F) + ETL control that streams `paperflow`
+      CLI commands in a background subprocess with a live ticker.
+
+Architecture (this rewrite):
+  * TerminalState dataclass instead of a loose dict.
+  * Dictionary key-dispatch table instead of an if/elif chain.
+  * No hardcoded paths: Path.home() + PAPERFLOW_DIR env.
+  * Console(width=, height=) constructed dynamically; no private _width.
+  * All errors -> ~/.mtui/error.log + visible toast, never swallowed.
+  * Read-only mode=ro SQLite pool, thread-safe, self-healing.
+=============================================================================
+"""
+from __future__ import annotations
+
+import csv
+import hashlib
+import io
+import json
+import logging
+import os
+import select
+import shutil
+import signal
+import sqlite3
+import subprocess
+import sys
+import termios
+import threading
+import time
+import tty
+from collections import deque
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Callable, Optional
+
+from rich import box
+from rich.console import Console, Group, RenderableType
+from rich.layout import Layout
+from rich.panel import Panel
+from rich.rule import Rule
+from rich.table import Table
+from rich.text import Text
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Configuration — every path is derived, never hardcoded.
+# ─────────────────────────────────────────────────────────────────────────────
+VERSION = "3.0.0"
+HOME = Path.home()
+
+MTUI_DIR = HOME / ".mtui"
+ERROR_LOG_PATH = MTUI_DIR / "error.log"
+WATCHLIST_PATH = MTUI_DIR / "watchlist.json"
+EXPORT_DIR = MTUI_DIR / "exports"
+
+# paperflow root: PAPERFLOW_DIR env wins, else $HOME/paperflow
+PAPERFLOW_DIR = Path(os.environ.get("PAPERFLOW_DIR", str(HOME / "paperflow"))).expanduser()
+WAREHOUSE = PAPERFLOW_DIR / "data" / "warehouse"
+MAIN_DB = WAREHOUSE / "paperflow.db"     # ETL hub: macro data, policy, audit
+GFCR_DB = WAREHOUSE / "gfcr.db"          # GFCR v6.0 formula snapshot + ratings
+
+PAPERFLOW_CMD = shutil.which("paperflow") or str(PAPERFLOW_DIR / "venv" / "bin" / "paperflow")
+
+MTUI_DIR.mkdir(parents=True, exist_ok=True)
+EXPORT_DIR.mkdir(parents=True, exist_ok=True)
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Bloomberg palette
+# ─────────────────────────────────────────────────────────────────────────────
+TXT     = "grey85"                 # body text
+AMBER   = "yellow"                 # header amber
+CYAN    = "bright_cyan"            # interactive selectors
+GREEN   = "bright_green"           # positive / high capacity
+RED     = "bright_red"             # negative / high vulnerability
+YELLOW  = "yellow"                 # moderate
+MAGENTA = "bright_magenta"         # alerts / highlights
+DIM     = "grey42"                 # muted metadata
+SEL     = "bold black on bright_cyan"
+CRIT    = "bold bright_magenta"
+SPARK_CHARS = "▁▂▃▄▅▆▇█"
+
+# GFCR score = capacity (higher better):  >70 green · 40-70 yellow · <40 red
+SCORE_OK, SCORE_WARN = 70, 40
+# GFCR module scores are RISK-form (0-1, lower better)
+RISK_OK, RISK_WARN = 0.35, 0.65
+
+# ─────────────────────────────────────────────────────────────────────────────
+# GFCR v6.0 module metadata (deep-dive pane B). Structural modules carry the
+# official weights; Dynamical Stress enters S_dynamic separately; Interactions
+# are the bounded ±0.10 tensor-product term.
+# ─────────────────────────────────────────────────────────────────────────────
+GFCR_MODULES: list[tuple[str, str, float]] = [
+    ("Fiscal Stress",          "fiscal_stress",           0.18),
+    ("External Vulnerability", "external_vulnerability",  0.15),
+    ("Financial Vulnerability", "financial_vulnerability", 0.15),
+    ("Dynamical Stress",       "dynamical_stress",        0.14),
+    ("Strategic Capacity",     "strategic_risk",          0.12),
+    ("Demographic Stress",     "demographic_stress",      0.10),
+    ("Climate Transition",     "climate_transition_risk", 0.08),
+    ("Technology",             "technology_risk",         0.08),
+    ("Supply Chain",           "supply_chain_risk",       0.07),
+    ("Resilience Buffer",      "resilience_buffer",       0.07),
+    ("Interactions",           "interaction_term",        0.00),
+]
+
+# Macro series for deep-dive pane C and the policy before/after analysis.
+MACRO_SERIES: list[tuple[str, str, str]] = [
+    ("Debt % GDP",               "GGXWDG",    "pct"),
+    ("Fiscal Balance % GDP",     "GGXONLB",   "pct"),
+    ("Primary Balance % GDP",    "GGXCNL",    "pct"),
+    ("Current Account % GDP",    "BCA_NGDPD", "pct"),
+    ("GDP per Hour Worked ($)",  "PDB_LV",    "val"),
+]
+# Codes where a FALLING value is an improvement (policy impact colouring)
+BETTER_DOWN = {"GGXWDG"}
+
+# Fields mirrored per split pane. The active fields hold whichever pane has
+# focus; p1_*/p2_* hold the passive panes so we can swap without redesigning
+# the renderers (they read state.<field>).
+PANE_FIELDS: tuple[str, ...] = ("screen", "sel", "sel_iso", "policy_sel",
+                                "sort_key", "sort_asc", "hscroll", "vscroll",
+                                "audit_imputed_only")
+
+# Live ticker tape: (short tag, yahoo symbol, display label). Polled by the
+# MarketDaemon thread every MARKET_POLL seconds.
+TICKERS: tuple[tuple[str, str, str], ...] = (
+    ("SPX",   "^GSPC",    "S&P 500"),
+    ("VIX",   "^VIX",     "VOLATILITY"),
+    ("US10Y", "^TNX",     "US 10Y"),
+    ("DXY",   "DX-Y.NYB", "DOLLAR IDX"),
+    ("GOLD",  "GC=F",     "GOLD"),
+    ("WTI",   "CL=F",     "CRUDE WTI"),
+    ("BTC",   "BTC-USD",  "BITCOIN"),
+)
+MARKET_POLL = 15          # seconds between yahoo polls
+TAPE_SPEED = 2            # marquee chars shifted per second
+
+# Omnibar function codes — Bloomberg-style screen jump words.
+FUNC_CODES: dict[str, int] = {
+    "DASH": 0, "MAT": 1, "DIV": 2, "POL": 3, "AUD": 4, "SYS": 5,
+    "MD": 1, "CD": 2, "PE": 3, "DA": 4, "SC": 5,
+}
+WORKSPACES_PATH = Path.home() / ".mtui" / "workspaces.json"
+
+# ETL commands exposed by the System Control + Data Audit screens.
+SYSTEM_ACTIONS: list[tuple[str, list[str], str]] = [
+    ("Full Live Pipeline",  ["--pipeline"], "seed → fetch → rate (live APIs)"),
+    ("Pipeline — Demo",     ["--pipeline", "--demo"], "offline synthetic round trip"),
+    ("Fetch Data",          ["--fetch"], "World Bank · IMF · OECD · WIPO · ITU"),
+    ("Rate — GFCR v6.0",    ["--rate", "--engine", "gfcr"], "11-module sovereign engine"),
+    ("Rate — Legacy",       ["--rate", "--engine", "legacy"], "legacy 5-dimension engine"),
+    ("Seed + Demo Data",    ["--seed", "--demo"], "reference panel + synthetic data"),
+    ("Sync GFCR DB",        ["--gfcr-db"], "rebuild gfcr.db formula snapshot"),
+    ("Health Check",        ["--health"], "system health report"),
+    ("Status",              ["--status"], "database summary"),
+    ("Launch Streamlit",    ["--ui"], "UI on http://localhost:8501"),
+]
+AUDIT_QUICK = SYSTEM_ACTIONS[:3]   # fetch / rate / seed from the audit screen
+
+SCREENS: list[dict] = [
+    {"key": "dashboard", "name": "Dashboard",         "short": "Dashboard",   "icon": "◎"},
+    {"key": "matrix",    "name": "Macro Matrix",      "short": "Macro Matrix","icon": "◈"},
+    {"key": "country",   "name": "Country Deep-Dive", "short": "Country Dive","icon": "⌖"},
+    {"key": "policy",    "name": "Policy Events",     "short": "Policy Events","icon": "≡"},
+    {"key": "audit",     "name": "Data Audit",        "short": "Data Audit",  "icon": "⚠"},
+    {"key": "system",    "name": "System Control",    "short": "System Ctl",  "icon": "⚙"},
+]
+
+SORT_KEYS = ["score", "country", "tier", "fisc", "ext", "dyn"]
+MATRIX_COL_WIDTHS = [1, 2, 14, 7, 4, 6, 5, 5, 5, 7, 9]  # → +2 each for padding
+SORT_LABEL = {"score": "score", "country": "country", "tier": "tier",
+              "fisc": "fiscal", "ext": "external", "dyn": "dynamical"}
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Strongly-typed terminal state (replaces the untyped `state: dict`).
+# ─────────────────────────────────────────────────────────────────────────────
+@dataclass
+class TerminalState:
+    # navigation / focus
+    screen: int = 0                      # index into SCREENS
+    focus: str = "nav"                   # "nav" | "content"
+    sel: int = 0                         # row cursor (matrix/policy/audit/system)
+    vscroll: int = 0                   # vertical scroll offset inside lists
+    sel_iso: str = "USA"                 # opened country (deep-dive)
+    hscroll: int = 0                     # horizontal column-window offset
+    # matrix sorting
+    sort_key: str = "score"
+    sort_asc: bool = False
+    order: list = field(default_factory=list)    # iso3 in current display order
+    # policy list selection (index into cached events)
+    policy_sel: int = 0
+    # audit
+    audit_imputed_only: bool = False             # (F) show estimated/fallback only
+    # global modes: normal | palette | search | watchlist | help
+    mode: str = "normal"
+    query: str = ""
+    results: list = field(default_factory=list)
+    res_idx: int = 0
+    # watchlist (persisted to ~/.mtui/watchlist.json)
+    watch: set = field(default_factory=set)
+    # cache / toast / refresh
+    refresh: int = 0
+    _cache: dict = field(default_factory=dict)
+    toast: str = ""
+    toast_t: float = 0.0
+    # ETL background job
+    job: Optional["Job"] = None
+    quit: bool = False
+    # ── live market tape (written by the MarketDaemon thread) ─────────
+    market_data: dict = field(default_factory=dict)   # ticker tag → (px, chg, pct)
+    market_live: bool = False                         # at least one poll landed
+    market_err: str = ""                              # why the tape is offline
+    offline: bool = False                             # --offline flag
+    # ── split-pane workspace + matrix heatmap + omnibar ───────────────
+    layout: str = "single"                            # "single" | "hsplit"
+    matrix_heatmap: bool = False                      # H toggles matrix view
+    omni_query: str = ""                              # omnibar input buffer
+    workspace_idx: int = -1
+    # per-pane mirrors (PANE_FIELDS below). The *active* fields hold whichever
+    # pane has focus; p1_*/p2_* are the passive copies used to swap panes.
+    p1_screen: int = 0
+    p1_sel: int = 0
+    p1_sel_iso: str = "USA"
+    p1_policy_sel: int = 0
+    p1_sort_key: str = "score"
+    p1_sort_asc: bool = False
+    p1_hscroll: int = 0
+    p1_vscroll: int = 0
+    p1_audit_imputed_only: bool = False
+    p2_screen: int = 1
+    p2_sel: int = 0
+    p2_sel_iso: str = "FRA"
+    p2_policy_sel: int = 0
+    p2_sort_key: str = "score"
+    p2_sort_asc: bool = False
+    p2_hscroll: int = 0
+    p2_vscroll: int = 0
+    p2_audit_imputed_only: bool = False
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Error logging — errors land in ~/.mtui/error.log and as a toast; nothing
+# is silently swallowed with `except Exception: pass`.
+# ─────────────────────────────────────────────────────────────────────────────
+logging.basicConfig(filename=str(ERROR_LOG_PATH), level=logging.INFO,
+                    format="%(asctime)s %(levelname)s %(name)s %(message)s")
+_log = logging.getLogger("mtui")
+
+
+def log_error(msg: str) -> None:
+    _log.error(msg, exc_info=True)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Read-only SQLite connection pool.
+# Persistent mode=ro connections (no open/close per render), thread-safe,
+# self-healing: a stale connection is dropped and reopened exactly once.
+# ─────────────────────────────────────────────────────────────────────────────
+class DBPool:
+    def __init__(self, paths: list[Path]) -> None:
+        self._paths = list(paths)
+        self._conns: dict[Path, sqlite3.Connection] = {}
+        self._lock = threading.RLock()
+
+    @staticmethod
+    def _open(path: Path) -> sqlite3.Connection:
+        con = sqlite3.connect(f"file:{path}?mode=ro", uri=True,
+                              check_same_thread=False, timeout=10.0)
+        con.row_factory = sqlite3.Row
+        con.execute("PRAGMA query_only=ON")     # belt & braces: read-only
+        return con
+
+    def query(self, db: Path, sql: str, params: tuple = ()) -> Optional[list]:
+        """Read-only SELECT. Returns a list of sqlite3.Row, or None on failure."""
+        if not db.exists():
+            return None
+        with self._lock:
+            for attempt in (1, 2):
+                con = self._conns.get(db)
+                if con is None:
+                    try:
+                        con = self._open(db)
+                        self._conns[db] = con
+                    except sqlite3.Error as exc:
+                        log_error(f"DB open failed {db}: {exc}")
+                        return None
+                try:
+                    return con.execute(sql, params).fetchall()
+                except sqlite3.Error as exc:
+                    # schema changed / WAL checkpoint collision -> purge & retry
+                    try:
+                        con.close()
+                    except sqlite3.Error:
+                        pass
+                    self._conns.pop(db, None)
+                    if attempt == 1:
+                        log_error(f"DB query failed {db}: {exc}")
+                        return None
+
+    def scalar(self, db: Path, sql: str, default=0, params: tuple = ()):
+        rows = self.query(db, sql, params)
+        if rows and rows[0][0] is not None:
+            return rows[0][0]
+        return default
+
+    def close(self) -> None:
+        with self._lock:
+            for con in self._conns.values():
+                try:
+                    con.close()
+                except sqlite3.Error:
+                    pass
+            self._conns.clear()
+
+    def status(self) -> dict:
+        main_ok = MAIN_DB.exists() and self.query(MAIN_DB, "SELECT 1") is not None
+        gf_ok = GFCR_DB.exists() and self.query(GFCR_DB, "SELECT 1") is not None
+        if main_ok and gf_ok:
+            label, color = "LIVE", GREEN
+        elif main_ok or gf_ok:
+            label, color = "PARTIAL", YELLOW
+        else:
+            label, color = "MISSING", RED
+        return {"label": label, "color": color, "main": main_ok, "gf": gf_ok}
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# MarketDaemon — live Yahoo Finance tape.
+# A daemon thread polls yfinance every MARKET_POLL seconds and writes the
+# snapshot into state.market_data (GIL makes the small dict write atomic).
+# yfinance is imported lazily: no package / no internet / --offline simply
+# leaves the tape in OFFLINE mode — the terminal never crashes without it.
+# ─────────────────────────────────────────────────────────────────────────────
+class MarketDaemon(threading.Thread):
+    def __init__(self, state: TerminalState) -> None:
+        super().__init__(daemon=True, name="MarketDaemon")
+        self.state = state
+        self._stop = threading.Event()
+
+    def stop(self) -> None:
+        self._stop.set()
+
+    def run(self) -> None:
+        try:
+            import yfinance as yf          # lazy: degrades to OFFLINE tape
+            import pandas as pd
+        except ImportError:
+            self.state.offline = True
+            self.state.market_err = "yfinance not installed"
+            return
+        symbols = [t[1] for t in TICKERS]
+        while not self._stop.is_set():
+            try:
+                df = yf.download(tickers=symbols, period="2d", interval="1d",
+                                 progress=False, group_by="ticker", threads=8)
+                if df is None or df.empty or df.shape[0] < 1:
+                    raise RuntimeError("empty download")
+                for tag, sym, _label in TICKERS:
+                    try:
+                        sub = df[sym] if isinstance(df.columns, pd.MultiIndex) else df
+                        closes = sub["Close"].dropna()
+                        if closes.empty:
+                            continue
+                        px = float(closes.iloc[-1])          # latest session
+                        prev = float(closes.iloc[-2]) if closes.size > 1 else px
+                        chg = px - prev
+                        pct = chg / prev * 100.0 if prev else 0.0
+                        self.state.market_data[tag] = (px, chg, pct)
+                        self.state.market_live = True
+                    except (KeyError, TypeError, ValueError, IndexError):
+                        continue            # per-symbol failure: skip, keep old
+            except Exception as exc:        # network / yahoo outage
+                self.state.market_err = str(exc)[:90]
+            if not self._stop.is_set():
+                self._stop.wait(MARKET_POLL)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Background ETL job: pipes stdout/stderr into a ring buffer the UI renders
+# live; killed via its own process group.
+# ─────────────────────────────────────────────────────────────────────────────
+class Job:
+    def __init__(self, title: str, argv: list[str]) -> None:
+        self.title = title
+        self.argv = argv
+        self.cmd = [PAPERFLOW_CMD, *argv]
+        self.proc: Optional[subprocess.Popen] = None
+        self.lines: deque[str] = deque(maxlen=400)
+        self.rc: Optional[int] = None
+        self.started = time.time()
+
+    def start(self) -> None:
+        self.proc = subprocess.Popen(
+            self.cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+            text=True, bufsize=1, cwd=PAPERFLOW_DIR, preexec_fn=os.setsid)
+        threading.Thread(target=self._pump, daemon=True).start()
+
+    def _pump(self) -> None:
+        assert self.proc is not None and self.proc.stdout is not None
+        for line in self.proc.stdout:
+            self.lines.append(line.rstrip("\r\n"))
+        self.rc = self.proc.wait()
+
+    def kill(self) -> None:
+        if self.proc and self.proc.poll() is None:
+            try:
+                os.killpg(os.getpgid(self.proc.pid), signal.SIGTERM)
+            except (ProcessLookupError, PermissionError):
+                pass
+            try:
+                self.proc.wait(timeout=3)
+            except subprocess.TimeoutExpired:
+                try:
+                    os.killpg(os.getpgid(self.proc.pid), signal.SIGKILL)
+                except (ProcessLookupError, PermissionError):
+                    pass
+        if self.rc is None:
+            self.rc = -9
+
+    @property
+    def done(self) -> bool:
+        return self.rc is not None
+
+    @property
+    def running(self) -> bool:
+        return self.proc is not None and self.proc.poll() is None
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Application: owns state, DB pool, console, and the key dispatch entry point.
+# ─────────────────────────────────────────────────────────────────────────────
+class App:
+    def __init__(self) -> None:
+        self.pool = DBPool([MAIN_DB, GFCR_DB])
+        self.s = TerminalState()
+        self.console = Console(force_terminal=True, highlight=False)
+        self.action_log: deque[str] = deque(maxlen=2)   # footer "last actions"
+        self._market: Optional[MarketDaemon] = None
+        self._last_size: tuple[int, int] | None = None
+        self.content_w: int = 80
+        self._load_watchlist()
+
+    # ── watchlist persistence ───────────────────────────────────────────
+    def _load_watchlist(self) -> None:
+        try:
+            raw = json.loads(WATCHLIST_PATH.read_text())
+            self.s.watch = {str(x).upper() for x in raw}
+        except (OSError, ValueError, json.JSONDecodeError) as exc:
+            log_error(f"watchlist load: {exc}")
+            self.s.watch = set()
+
+    def save_watchlist(self) -> None:
+        try:
+            WATCHLIST_PATH.write_text(json.dumps(sorted(self.s.watch)))
+        except OSError as exc:
+            log_error(f"watchlist save: {exc}")
+
+    # ── cache / refresh / toast ─────────────────────────────────────────
+    def cache(self, key: str, fn: Callable):
+        ck = (key, self.s.refresh)
+        if ck not in self.s._cache:
+            self.s._cache[ck] = fn()
+        return self.s._cache[ck]
+
+    def bump(self) -> None:
+        self.s.refresh += 1
+        self.s._cache.clear()
+
+    def toast(self, msg: str) -> None:
+        self.s.toast = msg
+        self.s.toast_t = time.monotonic()
+
+    def log_action(self, msg: str) -> None:
+        self.action_log.append(f"{time.strftime('%H:%M:%S')} {msg}")
+
+    @property
+    def rating_year(self):
+        return self.cache("round", lambda: self.pool.scalar(
+            GFCR_DB, "SELECT MAX(year) FROM country_ratings_gfcr", None))
+
+    def alert_count(self) -> int:
+        def _a():
+            rows = self.pool.query(GFCR_DB,
+                "SELECT COUNT(*) c FROM country_ratings_gfcr "
+                "WHERE year=(SELECT MAX(year) FROM country_ratings_gfcr) "
+                "AND gfcr_score < ?", (SCORE_WARN,))
+            return rows[0]["c"] if rows else 0
+        return self.cache("alerts", _a)
+
+    # ── live market lifecycle ──────────────────────────────────────────
+    def market_start(self, offline: bool = False) -> None:
+        """Boot the ticker tape. `offline` skips the thread entirely."""
+        if offline:
+            self.s.offline = True
+            return
+        daemon = MarketDaemon(self.s)
+        daemon.start()
+        self._market = daemon
+
+    def market_stop(self) -> None:
+        if self._market is not None:
+            self._market.stop()
+            self._market = None
+
+    def fetch_quote(self, tick: str) -> None:
+        """One-shot Yahoo quote (omnibar ticker): result arrives as a toast.
+        Runs in a daemon thread so a slow network never blocks the UI."""
+        def work() -> None:
+            try:
+                import yfinance as yf
+            except ImportError:
+                self.toast(f"{tick}: no yfinance (offline)")
+                return
+            try:
+                h = yf.Ticker(tick).history(period="5d")
+                closes = h["Close"].dropna()
+                if closes.empty:
+                    raise ValueError("no data")
+                px = float(closes.iloc[-1])
+                prev = float(closes.iloc[-2]) if closes.size > 1 else px
+                chg, pct = px - prev, (px - prev) / prev * 100 if prev else 0.0
+                self.toast(f"{tick}  {px:,.2f}  {chg:+,.2f}  ({pct:+,.1f}%)")
+            except Exception:
+                self.toast(f"{tick}: quote unavailable")
+        threading.Thread(target=work, daemon=True, name="QuoteFetch").start()
+
+    # ── ETL job runner ──────────────────────────────────────────────────
+    def run_job(self, title: str, argv: list[str]) -> None:
+        if self.s.job and self.s.job.running:
+            self.toast("ETL job already running — X kills it.")
+            return
+        self.s.job = Job(title, argv)
+        self.s.job.start()
+        self.log_action(f"▶ {title}")
+
+    def kill_job(self) -> None:
+        if self.s.job and self.s.job.running:
+            self.s.job.kill()
+            self.toast("job killed.")
+
+    # ── country registry ────────────────────────────────────────────────
+    def countries(self) -> list[dict]:
+        rows = self.cache("countries", lambda: self.pool.query(MAIN_DB,
+            "SELECT iso3, name FROM countries ORDER BY name"))
+        return [{"iso": r["iso3"], "name": r["name"]} for r in (rows or [])]
+
+    def country_name(self, iso: str) -> str:
+        name = self.cache("cname_" + iso, lambda: self.pool.scalar(
+            MAIN_DB, "SELECT name FROM countries WHERE iso3=?", "", (iso,)))
+        return name or iso
+
+    # ── GFCR loaders ────────────────────────────────────────────────────
+    def matrix_data(self) -> list[dict]:
+        rows = self.pool.query(GFCR_DB,
+            "SELECT r.iso3, COALESCE(c.name, r.iso3) name, r.gfcr_score, "
+            "       r.gfcr_tier, r.s_eff, r.fiscal_stress, "
+            "       r.external_vulnerability, r.dynamical_stress, "
+            "       r.peer_group, r.year "
+            "FROM country_ratings_gfcr r LEFT JOIN countries c ON c.iso3=r.iso3 "
+            "WHERE r.year=(SELECT MAX(year) FROM country_ratings_gfcr)")
+        out = [dict(r) for r in (rows or [])]
+        for d in out:
+            d["iso"] = d.pop("iso3")
+        # 3-year gfcr score history -> trend sparkline per country
+        hist = self.pool.query(GFCR_DB,
+            "SELECT iso3, year, gfcr_score FROM country_ratings_gfcr "
+            "ORDER BY iso3, year")
+        trend: dict[str, list[float]] = {}
+        for r in hist or []:
+            trend.setdefault(r["iso3"], []).append(r["gfcr_score"])
+        for d in out:
+            d["trend"] = trend.get(d["iso"], [])[-5:]
+        return out
+
+    def heatmap_data(self) -> list[dict]:
+        """40 countries × all 11 GFCR module risks, for the H-heatmap view.
+        The summary matrix cache only carries 3 modules; the heatmap queries
+        the full snapshot directly from country_ratings_gfcr."""
+        cols = ", ".join(c for _n, c, _w in GFCR_MODULES)
+        rows = self.pool.query(GFCR_DB,
+            f"SELECT r.iso3, COALESCE(c.name, r.iso3) name, {cols} "
+            "FROM country_ratings_gfcr r LEFT JOIN countries c ON c.iso3=r.iso3 "
+            "WHERE r.year=(SELECT MAX(year) FROM country_ratings_gfcr)")
+        out = [dict(r) for r in (rows or [])]
+        for d in out:
+            d["iso"] = d.pop("iso3")
+        return out
+
+    def rating_row(self, iso: str) -> Optional[dict]:
+        rows = self.pool.query(GFCR_DB,
+            "SELECT * FROM country_ratings_gfcr "
+            "WHERE iso3=? AND year=(SELECT MAX(year) FROM country_ratings_gfcr)",
+            (iso,))
+        return dict(rows[0]) if rows else None
+
+    def macro_series(self, iso: str) -> dict[str, list[tuple[int, float]]]:
+        codes = [c for _, c, _ in MACRO_SERIES]
+        marks = ",".join("?" * len(codes))
+        rows = self.pool.query(MAIN_DB,
+            "SELECT indicator_code, year, value FROM macro_indicators "
+            "WHERE iso3=? AND indicator_code IN (" + marks + ") "
+            "ORDER BY indicator_code, year", (iso, *codes))
+        out: dict[str, list[tuple[int, float]]] = {}
+        for r in rows or []:
+            out.setdefault(r["indicator_code"], []).append((r["year"], r["value"]))
+        return out
+
+    def narrative(self, iso: str) -> str:
+        return self.pool.scalar(MAIN_DB,
+            "SELECT narrative_summary FROM country_ratings WHERE iso3=? "
+            "AND narrative_summary IS NOT NULL AND narrative_summary!='' "
+            "ORDER BY year DESC LIMIT 1", "", (iso,))
+
+    # ── audit / policy loaders ──────────────────────────────────────────
+    def audit_rows(self, imputed_only: bool) -> list[dict]:
+        sql = ("SELECT iso3, year, indicator, source, fallback_source, "
+               "imputation_flag, raw_value, final_value FROM data_audit")
+        if imputed_only:
+            sql += " WHERE imputation_flag IN ('estimated','fallback_static','missing')"
+        sql += " ORDER BY year DESC, iso3 LIMIT 500"
+        rows = self.pool.query(MAIN_DB, sql)
+        out = []
+        for r in rows or []:
+            d = dict(r)
+            d["iso"] = d.pop("iso3")
+            out.append(d)
+        return out
+
+    def policy_events(self) -> list[dict]:
+        rows = self.pool.query(MAIN_DB,
+            "SELECT id, iso3, event_date, event_type, description, source_url "
+            "FROM policy_events ORDER BY event_date")
+        return [dict(r) for r in (rows or [])]
+
+    def policy_impact(self, iso: str, year: int) -> list[tuple]:
+        """(name, before_avg, after_avg, delta) for 5y-before vs 5y-after."""
+        macro = self.macro_series(iso)
+        out = []
+        for name, code, _kind in MACRO_SERIES:
+            pts = macro.get(code, [])
+            before = [v for (y, v) in pts if year - 5 <= y < year]
+            after = [v for (y, v) in pts if year <= y <= year + 4]
+            b = sum(before) / len(before) if before else None
+            a = sum(after) / len(after) if after else None
+            delta = (a - b) if (b is not None and a is not None) else None
+            out.append((name, b, a, delta))
+        return out
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Formatting helpers
+# ─────────────────────────────────────────────────────────────────────────────
+def num_or_str(v: object) -> str:
+    """Format a cell value that may be REAL or TEXT (e.g. pension_system_type)."""
+    if v is None:
+        return "—"
+    if isinstance(v, (int, float)):
+        return f"{float(v):.1f}" if not (float(v) != float(v)) else "—"  # NaN guard
+    return str(v)[:12]
+
+
+def hum(n) -> str:
+    try:
+        return f"{float(n):,.0f}"
+    except (TypeError, ValueError):
+        return "—"
+
+
+def pct(v: Optional[float], nd: int = 0) -> str:
+    if v is None:
+        return "—"
+    return f"{v * 100:.{nd}f}%"
+
+
+def fmt_size(n: float) -> str:
+    for unit in ("B", "KB", "MB", "GB"):
+        if n < 1024:
+            return f"{n:.0f}{unit}" if unit == "B" else f"{n:.1f}{unit}"
+        n /= 1024
+    return f"{n:.1f}TB"
+
+
+def tier_short(tier: Optional[str]) -> str:
+    return (tier or "?").split(" — ")[0] or "?"
+
+
+def tier_color(tier: Optional[str]) -> str:
+    t = (tier or "").upper()
+    if t.startswith("AAA"):
+        return "bold green"
+    if t.startswith("AA"):
+        return "green"
+    if t.startswith("A "):
+        return "bright_green"
+    if t.startswith("BBB"):
+        return "yellow"
+    if t.startswith("BB"):
+        return "bright_yellow"
+    if t.startswith("B "):
+        return "bright_red"
+    if t.startswith("CCC"):
+        return "bold red"
+    return "white"
+
+
+def tier_sort(tier: Optional[str]) -> int:
+    return {"AAA": 1, "AA": 2, "A": 3, "BBB": 4, "BB": 5, "B": 6, "CCC": 7}.get(
+        tier_short(tier), 9)
+
+
+def score_cell(v: Optional[float]) -> Text:
+    """GFCR capacity cell — green/amber/red by the 70/40 bands."""
+    if v is None:
+        return Text("—", style=DIM)
+    color = GREEN if v >= SCORE_OK else (YELLOW if v >= SCORE_WARN else RED)
+    return Text(f"{v:.1f}", style=color)
+
+
+def risk_cell(v: Optional[float], nd: int = 0) -> Text:
+    """Risk-form 0-1 cell — red = high vulnerability, green = low risk."""
+    if v is None:
+        return Text("—", style=DIM)
+    color = GREEN if v < RISK_OK else (YELLOW if v < RISK_WARN else RED)
+    return Text(pct(v, nd), style=color)
+
+
+def sparkline8(vals: list[float], width: int = 7) -> Text:
+    """ASCII micro-chart ▁▂▃▄▅▆▇█ over the observed range (Bloomberg spark)."""
+    if not vals:
+        return Text("·" * width, style=DIM)
+    if len(vals) == 1:                     # only one rating round so far
+        return Text("·" * width, style=DIM)
+    lo, hi = min(vals), max(vals)
+    if hi - lo < 1e-9:
+        return Text("▄" * width, style=CYAN)
+    step = (hi - lo) / (len(SPARK_CHARS) - 1)
+    window = vals[-width:]
+    out = "".join(SPARK_CHARS[min(len(SPARK_CHARS) - 1,
+                                  int((v - lo) / step))] for v in window)
+    return Text(out, style=CYAN)
+
+
+def risk_bar(v: Optional[float], width: int = 10) -> Text:
+    """Mini risk bar 0-100% — fills red/yellow/green by severity."""
+    v = 0.0 if v is None else max(0.0, min(1.0, float(v)))
+    filled = int(round(v * width))
+    color = GREEN if v < RISK_OK else (YELLOW if v < RISK_WARN else RED)
+    return Text("█" * filled + "░" * (width - filled), style=color)
+
+
+def ci_bar(p05: float, p50: float, p95: float, width: int = 16) -> Text:
+    """Uncertainty interval strip: ├───●───┤ style (p05 · p50 · p95)."""
+    if p05 is None or p50 is None or p95 is None or p95 <= p05:
+        return Text("—", style=DIM)
+    lo, hi = min(p05, p95), max(p05, p95)
+    rng = max(1e-9, hi - lo)
+    a = max(0, min(width - 1, int((p05 - lo) / rng * (width - 1))))
+    b = max(0, min(width - 1, int((p50 - lo) / rng * (width - 1))))
+    c = max(0, min(width - 1, int((p95 - lo) / rng * (width - 1))))
+    cells = ["░"] * width
+    cells[a], cells[c] = "┃", "┃"
+    cells[b] = "●"
+    t = Text("".join(cells), style=CYAN)
+    return t
+
+
+def col_window(cols: list, hscroll: int, avail: int) -> tuple[int, int]:
+    """Pick the contiguous run of columns that fits `avail`, honouring hscroll."""
+    n = len(cols)
+    if n == 0:
+        return 0, 0
+    widths = [w + 2 for (_h, w, _f) in cols]
+    k, acc = 0, 0
+    while k < n and acc + widths[k] <= avail:
+        acc += widths[k]
+        k += 1
+    k = max(1, k)
+    max_start = max(0, n - k)
+    start = max(0, min(hscroll, max_start))
+    return start, min(n, start + k)
+
+
+def pad_pair(left: Text, right: Text, width: int) -> Text:
+    """Line with both sides justified to `width` (Bloomberg header style).
+    If the pair overflows, the left side is trimmed so the right (status)
+    side never wraps on narrow terminals."""
+    overflow = width - len(left.plain) - len(right.plain)
+    pad = max(1, overflow)
+    if overflow < 1:                       # trim left so status never wraps
+        keep = max(0, width - len(right.plain) - 1)
+        if keep < len(left.plain):
+            left = left[:keep]
+    out = Text()
+    out.append_text(left)
+    out.append(" " * pad)
+    out.append_text(right)
+    return out
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Rendering — the Bloomberg canvas
+# ─────────────────────────────────────────────────────────────────────────────
+def render_ticker(state: TerminalState, cols: int) -> RenderableType:
+    """Line 0 — the live market marquee.
+
+    Quotes are pulled from state.market_data (written by the MarketDaemon).
+    The window slides TAPE_SPEED chars/second using the wall clock, so the
+    dirty-check sig tuple picks the movement up at the normal repaint cadence
+    (no extra timer, no busy redraw). Green = up, red = down, trading-floor
+    style. OFFLINE is shown when --offline / no yfinance / no internet.
+    """
+    if state.offline:
+        return Text("  TAPE OFFLINE — live market disabled (--offline)"
+                    + "─" * max(0, cols - 45), style="grey30")
+    if not state.market_live:
+        msg = f"  TAPE — connecting to yahoo finance…  {state.market_err}"
+        return Text(msg[:cols].ljust(cols), style="bold yellow")
+    quotes: list[Text] = []
+    for tag, _sym, label in TICKERS:
+        if tag not in state.market_data:
+            continue
+        px, chg, pct = state.market_data[tag]
+        up = pct >= 0
+        q = Text(f"  {label:<11}", style="bold cyan")
+        q.append(f"{px:>9.1f}", style="bold white")
+        q.append(f" {chg:>+7.1f} {pct:>+5.1f}%",
+                 style="bold bright_green" if up else "bold bright_red")
+        quotes.append(q)
+    if not quotes:
+        return Text("  TAPE — awaiting market data…".ljust(cols), style=DIM)
+    tape = Text("▐", style="grey30")
+    for q in quotes:
+        tape.append_text(q)
+    tape.append("▌", style="grey30")
+    total = len(tape)
+    big = tape + tape + tape                        # triple copy: seamless wrap
+    off = int(time.time() * TAPE_SPEED) % total     # char-exact marquee slide
+    line = big[off:off + cols]                      # Text slicing keeps styles
+    if len(line) < cols:
+        line.append_text(Text(" " * (cols - len(line)), style=DIM))
+    return line
+
+
+def render_header(state: TerminalState, app: App, cols: int) -> RenderableType:
+    """Top band: system id · module · round · clock · DB status · alerts."""
+    module = f"{SCREENS[state.screen]['icon']} {SCREENS[state.screen]['name'].upper()}"
+    left = Text()
+    left.append(" MTUI ", style="bold black on bright_blue")
+    left.append("  PAPERFLOW ", style="bold yellow")
+    left.append("GFCR v6.0", style="yellow")
+    left.append(f" │ {module}", style="bold grey93")
+
+    db = app.pool.status()
+    right = Text()
+    right.append(" │ ", style=DIM)
+    right.append(f"ROUND {app.rating_year or '—'}", style=YELLOW)
+    right.append(" │ ", style=DIM)
+    right.append(f"DB:{db['label']}", style=f"bold {db['color']}")
+    right.append(" │ ", style=DIM)
+    n_al = app.alert_count()
+    right.append(f"ALRT {n_al}", style=CRIT if n_al else "white")
+    right.append(" │ ", style=DIM)
+    right.append(time.strftime("%H:%M:%S"), style="bold cyan")
+
+    return Group(pad_pair(left, right, cols), Rule(style="grey30"))
+
+
+def render_nav(state: TerminalState, app: App, width: int) -> RenderableType:
+    """Left rail (≈15%): the six functional screens + mini status footer."""
+    grid = Table.grid(padding=(0, 1), expand=True)
+    grid.add_column(ratio=1)
+    for i, s in enumerate(SCREENS):
+        active, focused = (i == state.screen), (i == state.screen and state.focus == "nav")
+        label = s.get("short", s["name"]).upper()
+        row = Text()
+        if focused:                                   # reverse-video selector
+            row.append(f" {s['icon']} {label} ", style=SEL)
+        elif active:
+            row.append(f" {s['icon']} ", style=AMBER)
+            row.append(label, style=f"bold {AMBER}")
+            row.append(" ◀", style=CYAN)
+        else:
+            row.append(f" {s['icon']} ", style=DIM)
+            row.append(label, style=TXT)
+        grid.add_row(row)
+
+    grid.add_row(Text("", style=DIM))
+    watch_n = len(state.watch)
+    grid.add_row(Text(f"{len(app.countries())} countries · {app.alert_count()} alerts",
+                      style=DIM))
+    grid.add_row(Text(f"watch {watch_n} · round {app.rating_year or '—'}", style=DIM))
+    return Panel(grid, box=box.SQUARE, border_style="grey23", padding=(0, 0))
+
+
+def render_footer(state: TerminalState, app: App, cols: int) -> RenderableType:
+    """Bottom band: command line · status line · keybinding hint."""
+    c = state
+    # line 1 — command buffer / running job ticker
+    if c.mode in ("palette", "search"):
+        kind = "SEARCH" if c.mode == "search" else "CMD"
+        line1 = Text(f" {kind} ", style=SEL)
+        line1.append(f" » {c.query}▌ ", style="bold white")
+        line1.append(f"({len(c.results)} hits)", style=DIM)
+    else:
+        line1 = Text()
+        line1.append(" » ", style=CYAN)
+        if c.job and c.job.running:
+            line1.append(f"⏳ {c.job.title}", style="bold yellow")
+            tail = c.job.lines[-1] if c.job.lines else ""
+            line1.append("  " + tail[:cols - 44], style="grey70")
+        elif c.job and c.job.done:
+            ok = c.job.rc in (0, None)
+            line1.append(f"{'✔' if ok else '✘'} {c.job.title} "
+                         f"(exit {c.job.rc})", style="green" if ok else "red")
+        else:
+            line1.append(": commands · Ctrl+F global search · F2 watchlist",
+                         style=DIM)
+
+    # line 2 — toast + last two actions
+    line2 = Text()
+    if c.toast and time.monotonic() - c.toast_t < 4.0:
+        line2.append("▌ " + c.toast + " ", style="bold magenta")
+    for a in app.action_log:
+        line2.append(" · " + a, style="grey60")
+    line2 = pad_pair(line2, Text(time.strftime("%H:%M:%S"), style="bold cyan"), cols)
+
+    # line 3 — contextual keybinding hint
+    hints = {
+        "normal": "↑↓ nav · Enter act · Tab focus · 1-6 · s sort · H heatmap · "
+                  "< > h-scroll · W pin · E export · / palette · SPACE omni · "
+                  "F9 split · F3/F4 ws",
+        "palette": "type to filter · ↑↓ pick · Enter run · Esc cancel",
+        "search": "type to search DB · ↑↓ pick · Enter open · Esc cancel",
+        "watchlist": "↑↓ pick · Enter deep-dive · W unpin · Esc close",
+        "omni": "ISO→dive · MAT/DIV/AUD/SYS→screen · GGXWDG→macro · AAPL→quote · Esc",
+        "help": "any key or Esc to close",
+    }[c.mode]
+    hint_line = pad_pair(Text(hints, style=DIM), Text("q quit", style=DIM), cols)
+
+    # line 4 — OMNIBAR (very bottom line, Line L-1): Bloomberg-style jump bar
+    omni = Text()
+    if c.mode == "omni":
+        omni.append(" OMNIBAR ", style=SEL)
+        omni.append(f" {c.omni_query}▌ ", style="bold white")
+        omni.append("ISO→deep-dive · MAT/DIV/AUD/SYS→screen · GGXWDG→global search · "
+                    "AAPL→live quote · Esc close", style=DIM)
+    else:
+        omni.append(" OMNIBAR ", style="grey30")
+        omni.append("SPACE ", style=CYAN)
+        omni.append("jump — ISO · function code · macro code · ticker quote   "
+                    "F3 cycle ws · F4 save ws · F9 split · H heatmap", style=DIM)
+    return Group(line1, line2, hint_line, omni)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Generic dense data grid (used by matrix / audit / policy / system)
+# ─────────────────────────────────────────────────────────────────────────────
+def render_grid(state: TerminalState, app: App, title: str, cols: list,
+                rows: list, height: int, sel: int | None = None,
+                subtitle: str = "") -> RenderableType:
+    """Vertical + horizontal scrolling grid, Bloomberg density, box.NONE."""
+    inner = max(2, height - 4)                       # title + header + borders
+    total = len(rows)
+    voff = max(0, min(state.vscroll, max(0, total - inner)))
+    vis = rows[voff:voff + inner]
+
+    # horizontal column window (the <> keys shift it)
+    start_c, end_c = col_window(cols, state.hscroll, app.content_w)
+    win = cols[start_c:end_c]
+
+    t = Table(box=box.SIMPLE, expand=False, pad_edge=False, show_header=True,
+              header_style="bold yellow", padding=(0, 1))
+    for hd, wdt, _fn in win:
+        t.add_column(hd, width=wdt, no_wrap=True)
+    for i, row in enumerate(vis):
+        abs_i = voff + i
+        if sel is not None and abs_i == sel and state.focus == "content":
+            # selected row: reverse-video (cells keep their plain text)
+            cells = [Text(fn(row).plain, style="bold black on bright_cyan")
+                     for _hd, _wdt, fn in win]
+        else:
+            cells = [fn(row) for _hd, _wdt, fn in win]
+        t.add_row(*cells)
+
+    sub = f"{voff + 1}-{min(voff + inner, total)} / {total}" if total else "empty"
+    if end_c < len(cols):
+        sub += f"   cols {start_c + 1}-{end_c}/{len(cols)}  < >"
+    if subtitle:
+        sub = subtitle + "   " + sub
+    return Panel(t, title=title, title_align="left", subtitle=sub,
+                 subtitle_align="right", border_style=CYAN if state.focus == "content" else "grey30",
+                 box=box.SIMPLE, padding=(0, 0))
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Screen: Dashboard (system overview)
+# ─────────────────────────────────────────────────────────────────────────────
+def render_dashboard(state: TerminalState, app: App, w: int, h: int) -> RenderableType:
+    def _db_stats():
+        return {
+            "main_db": MAIN_DB.exists(), "gf_db": GFCR_DB.exists(),
+            "main_sz": fmt_size(MAIN_DB.stat().st_size) if MAIN_DB.exists() else "—",
+            "gf_sz": fmt_size(GFCR_DB.stat().st_size) if GFCR_DB.exists() else "—",
+            "countries": app.pool.scalar(MAIN_DB, "SELECT COUNT(*) FROM countries"),
+            "macro": app.pool.scalar(MAIN_DB, "SELECT COUNT(*) FROM macro_indicators"),
+            "policy": app.pool.scalar(MAIN_DB, "SELECT COUNT(*) FROM policy_events"),
+            "audit": app.pool.scalar(MAIN_DB, "SELECT COUNT(*) FROM data_audit"),
+            "ratings": app.pool.scalar(GFCR_DB, "SELECT COUNT(*) FROM country_ratings_gfcr"),
+            "year": app.rating_year,
+        }
+    st = app.cache("db_stats", _db_stats)
+
+    left = Table.grid(padding=(0, 1), expand=True)
+    left.add_column(style="bold cyan", no_wrap=True, width=16)
+    left.add_column(style=TXT)
+    left.add_row("warehouse", str(WAREHOUSE))
+    left.add_row("paperflow.db", f"{st['main_sz']}  {'LIVE' if st['main_db'] else 'MISSING'}")
+    left.add_row("gfcr.db", f"{st['gf_sz']}  {'LIVE' if st['gf_db'] else 'MISSING'}")
+    left.add_row("countries", hum(st["countries"]))
+    left.add_row("macro rows", hum(st["macro"]))
+    left.add_row("policy events", hum(st["policy"]))
+    left.add_row("audit rows", hum(st["audit"]))
+    left.add_row("gfcr ratings", hum(st["ratings"]))
+    left.add_row("rating round", str(st["year"] or "—"))
+
+    data = app.cache("matrix", app.matrix_data)
+    top5 = sorted([d for d in data if d["gfcr_score"] is not None],
+                  key=lambda d: d["gfcr_score"], reverse=True)
+    right = Table.grid(padding=(0, 1), expand=True)
+    right.add_column(style=DIM, no_wrap=True, width=4)
+    right.add_column(style="bold white", no_wrap=True, width=5)
+    right.add_column(style=TXT, no_wrap=True, width=20)
+    right.add_column(style=TXT, no_wrap=True, width=18)
+    right.add_column(style=DIM, no_wrap=True)
+    right.add_row("RANK", "ISO", "COUNTRY", "SCORE", "TIER")
+    for i, d in enumerate(top5[:5], 1):
+        right.add_row(f"#{i}", d["iso"], (d["name"] or "")[:20],
+                      f"{d['gfcr_score']:.1f}", tier_short(d["gfcr_tier"]),
+                      style="green" if i <= 2 else "white")
+    right.add_row("", "", "", "", "")
+    right.add_row("— BOTTOM (CRISIS WATCH) —", "", "", "", "")
+    for i, d in enumerate(reversed(top5[-3:]), 1):
+        right.add_row(f"#{6-i}", d["iso"], (d["name"] or "")[:20],
+                      f"{d['gfcr_score']:.1f}", tier_short(d["gfcr_tier"]),
+                      style="red")
+    right.add_row("", "", "", "", "")
+    right.add_row(f"ALERTS (<{SCORE_WARN})", "", f"{app.alert_count()}", "", "")
+
+    mid = Table.grid(expand=True, padding=(0, 2))
+    mid.add_column(ratio=1)
+    mid.add_column(ratio=1)
+    mid.add_row(Panel(left, title="DATABASES", border_style="grey30",
+                      box=box.SIMPLE, padding=(0, 1)),
+                Panel(right, title="SOVEREIGN LEADERS / LAGGARDS",
+                      border_style="grey30", box=box.SIMPLE, padding=(0, 1)))
+
+    # watchlist chips
+    chips = Text()
+    if state.watch:
+        chips.append("WATCHLIST: ", style="bold yellow")
+        for iso in sorted(state.watch):
+            row = next((d for d in data if d["iso"] == iso), None)
+            if row:
+                chips.append(f" {iso} ", style="black on yellow")
+                chips.append(f"{row['gfcr_score']:.1f} ", style="bold white")
+            else:
+                chips.append(f" {iso} ", style="black on yellow")
+                chips.append("n/a ", style=DIM)
+    else:
+        chips.append("WATCHLIST: empty — press W on a country in Macro Matrix "
+                     "to pin it here (F2 opens the watchlist pane).", style=DIM)
+
+    job = ""
+    if state.job:
+        j = state.job
+        job = f"JOB {j.title}: " + ("RUNNING ⏳" if j.running else
+                                    f"EXIT {j.rc} " + ("✔" if j.rc == 0 else "✘"))
+    bot = Table.grid(padding=(0, 1), expand=True)
+    bot.add_column(ratio=1)
+    bot.add_column(style=DIM, no_wrap=True, width=18)
+    bot.add_row(chips, Text(job or "ETL: idle", style=DIM))
+    return Group(mid, "", Panel(bot, title="POSITION WATCH", border_style="grey30",
+                                box=box.SIMPLE, padding=(0, 1)))
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Screen: Global Macro Matrix (sortable, dense, sparklined)
+# ─────────────────────────────────────────────────────────────────────────────
+def render_matrix(state: TerminalState, app: App, w: int, h: int) -> RenderableType:
+    data = app.cache("matrix", app.matrix_data)
+    key, asc = state.sort_key, state.sort_asc
+
+    def sortfn(d: dict):
+        if key == "country":
+            return (d["name"] or "").lower()
+        if key == "tier":
+            return tier_sort(d["gfcr_tier"])
+        if key == "fisc":
+            return d["fiscal_stress"] if d["fiscal_stress"] is not None else 1e9
+        if key == "ext":
+            return d["external_vulnerability"] if d["external_vulnerability"] is not None else 1e9
+        if key == "dyn":
+            return d["dynamical_stress"] if d["dynamical_stress"] is not None else 1e9
+        return d["gfcr_score"] if d["gfcr_score"] is not None else -1
+
+    rows = sorted(data, key=sortfn, reverse=not asc)
+    state.order = [d["iso"] for d in rows]          # shared with ENTER handler
+    if state.sel >= len(rows):
+        state.sel = 0
+
+    cols = [
+        ("★", 1, lambda d: Text("★" if d["iso"] in state.watch else "·",
+                                style="yellow" if d["iso"] in state.watch else "grey30")),
+        ("ISO", 5, lambda d: Text(d["iso"], style="bold cyan")),
+        ("COUNTRY", 14, lambda d: Text((d["name"] or "")[:14], style=TXT)),
+        ("SCORE", 7, lambda d: score_cell(d["gfcr_score"])),
+        ("TIER", 4, lambda d: Text(tier_short(d["gfcr_tier"]),
+                                   style=tier_color(d["gfcr_tier"]))),
+        ("S_EFF", 6, lambda d: Text(
+            f"{d['s_eff']:.2f}" if d["s_eff"] is not None else "—",
+            style=("bright_green" if d["s_eff"] < RISK_OK
+                   else ("yellow" if d["s_eff"] < RISK_WARN else "bright_red"))
+            if d["s_eff"] is not None else DIM)),
+        ("FISC", 5, lambda d: risk_cell(d["fiscal_stress"])),
+        ("EXT", 5, lambda d: risk_cell(d["external_vulnerability"])),
+        ("DYN", 5, lambda d: risk_cell(d["dynamical_stress"])),
+        ("TREND3Y", 8, lambda d: sparkline8(d["trend"])),
+        ("PEER", 9, lambda d: Text(d["peer_group"] or "—", style=DIM)),
+    ]
+    arrow = "▾" if not asc else "▴"
+    sub = f"SORT {SORT_LABEL[key].upper()} {arrow}  [s] cycle · [S] flip · Enter = deep-dive"
+    return render_grid(state, app, "MACRO MATRIX — GLOBAL SOVEREIGN CAPACITY · GFCR v6.0",
+                       cols, rows, h, sel=state.sel, subtitle=sub)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Screen: Sovereign Deep-Dive (4 panes)
+# ─────────────────────────────────────────────────────────────────────────────
+def render_country(state: TerminalState, app: App, w: int, h: int) -> RenderableType:
+    iso = state.sel_iso.upper()
+    rating = app.cache(f"rating_{iso}", lambda: app.rating_row(iso))
+    if rating is None:                              # iso not in rating panel
+        data = app.cache("matrix", app.matrix_data)
+        if data:
+            iso = data[0]["iso"]
+            rating = app.cache(f"rating_{iso}", lambda: app.rating_row(iso))
+            state.sel_iso = iso
+        else:
+            return Panel(Text("No ratings in gfcr.db — run System Control → Rate GFCR.",
+                              style=DIM), border_style="grey30")
+
+    macro = app.cache(f"macro_{iso}", lambda: app.macro_series(iso))
+    narr = app.cache(f"narr_{iso}", lambda: app.narrative(iso))
+    name = app.country_name(iso)
+
+    # ── Pane A: headline ────────────────────────────────────────────────
+    score = rating.get("gfcr_score")
+    tier = rating.get("gfcr_tier") or "?"
+    p05, p50, p95 = (rating.get("gfcr_score_p05"), rating.get("gfcr_score_p50"),
+                     rating.get("gfcr_score_p95"))
+    a = Table.grid(padding=(0, 1), expand=True)
+    a.add_column(style="bold white")
+    a.add_row(f"{iso}  {name.upper()}")
+    a.add_row(Text(f"GFCR {score:.1f} / 100" if score is not None else "GFCR —",
+                   style=f"bold {'green' if (score or 0) >= SCORE_OK else ('yellow' if (score or 0) >= SCORE_WARN else 'red')}"))
+    a.add_row(Text(f"TIER  {tier}", style=tier_color(tier)))
+    a.add_row(ci_bar(p05 or 0, p50 or 0, p95 or 0))
+    a.add_row(Text(f"90% CI  {p05:.1f} ─ {p50:.1f} ─ {p95:.1f}" if p05 is not None else "90% CI —",
+                   style=DIM))
+    a.add_row(Text(f"ROUND {rating.get('year') or '—'} · PEER {rating.get('peer_group') or '—'} · "
+                   f"S_eff {rating.get('s_eff'):.3f}" if rating.get("s_eff") is not None
+                   else f"ROUND {rating.get('year') or '—'}", style=DIM))
+    g, d_ = rating.get("johnson_su_gamma"), rating.get("johnson_su_delta")
+    a.add_row(Text(f"Johnson SU  γ={g:.2f} δ={d_:.2f}" if g is not None and d_ is not None
+                   else "", style="grey35"))
+
+    # ── Pane B: 11-module breakdown ─────────────────────────────────────
+    b_rows: list[RenderableType] = []
+    for mname, col, weight in GFCR_MODULES:
+        v = rating.get(col)
+        if v is None:
+            continue
+        line = Text()
+        line.append(f" {mname:<24}", style="white")
+        line.append(risk_bar(v, 8))
+        line.append(f" {pct(v)}", style=risk_cell(v).style)
+        if weight:
+            line.append(f" w{weight:.2f}", style=DIM)
+        b_rows.append(line)
+    b_panel = Panel(Group(*b_rows), title=f"11-MODULE BREAKDOWN — {iso}",
+                    border_style="grey30", box=box.SIMPLE, padding=(0, 1))
+
+    # ── Pane C: 10-year trajectory — plotext ASCII chart ──────────────
+    # (falls back to one-line sparklines when plotext is missing / thin data)
+    mid_h = max(6, h * 3 // 9)             # mid pane height, needed by the chart
+    c_panel = _render_macro_chart(state, app, iso, macro, w, mid_h)
+
+    # ── Pane D: AI narrative ────────────────────────────────────────────
+    if narr:
+        d_body = Text(narr, style="grey75")
+    else:
+        d_body = Text("No narrative stored for this sovereign. Run System Control → "
+                      "Rate — GFCR v6.0 to generate the LLM narrative (future-proof "
+                      "for DeepSeek integration).", style=DIM)
+    d_panel = Panel(d_body, title="AI NARRATIVE / NOTES",
+                    border_style="grey30", box=box.SIMPLE, padding=(0, 1))
+
+    # ── assemble the 4 panes ───────────────────────────────────────────
+    top_h = max(10, h * 4 // 9)
+    lay = Layout()
+    lay.split_column(
+        Layout(name="top", size=top_h),
+        Layout(name="mid", size=mid_h),
+        Layout(name="bot", ratio=1),
+    )
+    lay["top"].split_row(
+        Layout(name="A", ratio=2),
+        Layout(name="B", ratio=3),
+    )
+    lay["top"]["A"].update(Panel(a, title=f"{iso} HEADLINE", border_style="grey30",
+                                 box=box.SIMPLE, padding=(0, 1)))
+    lay["top"]["B"].update(b_panel)
+    lay["mid"].update(c_panel)
+    lay["bot"].update(d_panel)
+    return lay
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Chart helpers (plotext) — the deep-dive mid pane renders the 10-year path.
+# ─────────────────────────────────────────────────────────────────────────────
+def _chart_fallback(macro: dict) -> RenderableType:
+    """The old sparkline list — used when plotext is absent or data is thin."""
+    c_lines: list[RenderableType] = []
+    for mname, code, kind in MACRO_SERIES:
+        pts = macro.get(code, [])
+        if not pts:
+            c_lines.append(Text(f" {mname:<26} — no data", style=DIM))
+            continue
+        last5 = pts[-5:]
+        line = Text()
+        line.append(f" {mname:<26}", style="white")
+        line.append(sparkline8([v for _, v in last5], 8))
+        line.append("  " + " ".join(f"{v:.1f}" for _, v in last5[-3:]), style="grey70")
+        line.append(f"  latest {last5[-1][1]:.1f}", style="bold white")
+        c_lines.append(line)
+    return Panel(Group(*c_lines), title="5-YEAR MACRO TIME-SERIES — sparkline fallback",
+                 border_style="grey30", box=box.SIMPLE, padding=(0, 1))
+
+
+def _render_macro_chart(state: TerminalState, app: App, iso: str,
+                        macro: dict, w: int, h: int) -> RenderableType:
+    """10-year Debt/GDP + productivity-growth ASCII line chart.
+
+    plotext renders into a string (we pass plotsize = the Rich pane's inner
+    dims), captured and injected into a Rich Panel via Text.from_ansi so the
+    plotext colors survive. Uses the stateless global API with clf/clc between
+    series; a missing import or short series degrades to the sparkline list.
+    """
+    fallback = _chart_fallback(macro)
+    try:
+        import plotext as plt
+    except ImportError:
+        return fallback
+    debt = macro.get("GGXWDG", [])
+    prod = macro.get("PDB_LV", [])
+    tfp = macro.get("rtfpna", [])                   # TFP index (real world)
+    if len(debt) < 2 or h < 8:
+        return fallback
+    years = [int(y) for y, _ in debt[-10:]]
+    dvals = [v for _, v in debt[-10:]]
+
+    # growth series: prefer TFP index, else y/y % of GDP/hour; a completely
+    # flat demo series is dropped so the pane shows only the informative one
+    gvals: list[Optional[float]] = []
+    grow_label = "TFP INDEX (rtfpna)"
+    if len(tfp) >= 2:
+        tv = {int(y): v for y, v in tfp}
+        gvals = [tv.get(y) for y in years]
+    else:
+        grow_label = "PRODUCTIVITY GROWTH % y/y (PDB_LV)"
+        pv = {int(y): v for y, v in prod}
+        for y in years:
+            v, v0 = pv.get(y), pv.get(y - 1)
+            gvals.append((v - v0) / v0 * 100.0 if (v is not None and v0) else None)
+    if all(v is None for v in gvals):
+        gvals = []
+
+    series = [("DEBT/GDP %", years, dvals, "yellow")]
+    flat = any(v is not None for v in gvals) and         (max(g for g in gvals if g is not None) - min(g for g in gvals if g is not None)) < 1e-9
+    if gvals and not flat:
+        series.append((grow_label, years, gvals, "green"))
+    cw = max(24, w - 8)
+    # plotext emits ch+1 rows per chart; 2 border rows; keep everything in pane
+    ch = max(3, (max(6, h) - 6) // len(series))
+    charts: list[RenderableType] = []
+    for title, xs, ys, color in series:
+        plt.clf()
+        plt.clc()
+        plt.theme("dark")
+        plt.plotsize(cw, ch)
+        plt.plot(xs, ys, color=color)
+        charts.append(Text.from_ansi(plt.build()))
+    labels = ", ".join(t for t, _x, _y, _c in series)
+    return Panel(Group(*charts),
+                 title=f"10-YEAR PATH — {iso}  ({labels})",
+                 border_style="grey30", box=box.SIMPLE, padding=(0, 1))
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Screen: Policy Effectiveness Tracker
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _policy_has_data(app: App, ev: dict) -> bool:
+    """True if any macro series exists within the ±5y impact window."""
+    year = int(str(ev["event_date"])[:4])
+    for _name, code, _kind in MACRO_SERIES:
+        pts = app.macro_series(ev["iso3"]).get(code, [])
+        if any(year - 5 <= y <= year + 4 for y, _v in pts):
+            return True
+    return False
+
+
+def render_policy(state: TerminalState, app: App, w: int, h: int) -> RenderableType:
+    events = app.cache("policy_events", app.policy_events)
+    if not events:
+        return Panel(Text("No policy events in DB (policy_events table empty).",
+                          style=DIM), border_style="grey30")
+    # Auto-select the most recent reform that actually has ±5y macro data
+    # (demo data spans 2016-2026, so older events would show "no data").
+    if state.policy_sel >= len(events) or not _policy_has_data(app, events[state.policy_sel]):
+        for i, e in enumerate(events):
+            if _policy_has_data(app, e):
+                state.policy_sel = i
+                break
+        else:
+            state.policy_sel = 0
+
+    ev = events[state.policy_sel]
+    year = int(str(ev["event_date"])[:4])
+    impact = app.cache(f"impact_{ev['iso3']}_{year}",
+                       lambda: app.policy_impact(ev["iso3"], year))
+
+    # ── left: dense one-line-per-reform event feed (scrollable) ────────
+    inner = max(3, h - 3)
+    total = len(events)
+    voff = max(0, min(state.vscroll, max(0, total - inner)))
+    vis = events[voff:voff + inner]
+    t = Table(box=box.SIMPLE, expand=True, show_header=True, header_style="bold yellow",
+              padding=(0, 1))
+    t.add_column("ISO", width=5, no_wrap=True)
+    t.add_column("DATE", width=10, no_wrap=True)
+    t.add_column("TYPE", width=13, no_wrap=True)
+    t.add_column("REFORM", ratio=1, no_wrap=True, overflow="ellipsis")
+    for i, e in enumerate(vis):
+        abs_i = voff + i
+        if abs_i == state.policy_sel and state.focus == "content":
+            cells = [Text(x, style="bold black on bright_cyan") for x in
+                     (e["iso3"], str(e["event_date"])[:10], (e["event_type"] or ""),
+                      (e["description"] or ""))]
+        else:
+            cells = [Text(e["iso3"], style="bold cyan"),
+                     Text(str(e["event_date"])[:10], style=DIM),
+                     Text(e["event_type"] or "—", style=YELLOW),
+                     Text(e["description"] or "", style=TXT)]
+        t.add_row(*cells)
+    left_panel = Panel(t, title=f"POLICY EVENTS ({total}) — ↑↓ select",
+                       subtitle=f"{voff + 1}-{min(voff + inner, total)}/{total}",
+                       subtitle_align="right", border_style="grey30",
+                       box=box.SIMPLE, padding=(0, 0))
+
+    # ── right: compact one-line impact deltas (5y before vs after) ─────
+    imp_lines: list[RenderableType] = []
+    for mname, b, a_, delta in impact:
+        label = Text(f" {mname:<24}", style="white")
+        if b is None and a_ is None:
+            imp_lines.append(label + Text("  no data", style=DIM))
+            continue
+        before = f"{b:.1f}" if b is not None else "—"
+        after = f"{a_:.1f}" if a_ is not None else "—"
+        if delta is None:
+            dcell = Text(" Δ—", style=DIM)
+        else:
+            better = (delta < 0) if mname.split(" ")[0] in BETTER_DOWN else (delta > 0)
+            dcell = Text(f" Δ{delta:+.1f}", style=GREEN if better else RED)
+        imp_lines.append(label + Text(f" {before} → {after}", style="grey70") + dcell)
+    right_panel = Panel(Group(*imp_lines),
+                        title=f"IMPACT {ev['iso3']} · {year}±5Y",
+                        border_style="grey30", box=box.SIMPLE, padding=(0, 1))
+
+    # ── bottom: full description of the selected reform ────────────────
+    desc = Text(f" {ev['iso3']} {ev['event_date']} — {ev['event_type']}: "
+                f"{ev['description']}", style="grey75")
+    if ev.get("source_url"):
+        desc.append(f"   [{ev['source_url'][:70]}]", style=DIM)
+    desc_panel = Panel(desc, title="REFORM DETAIL", border_style="grey30",
+                       box=box.SIMPLE, padding=(0, 1))
+
+    lay = Layout()
+    lay.split_row(Layout(name="left", ratio=3), Layout(name="right", ratio=2))
+    lay["left"].update(left_panel)
+    lay["right"].update(right_panel)
+    outer = Layout()
+    outer.split_column(Layout(name="main", ratio=1), Layout(name="desc", size=4))
+    outer["main"].update(lay)
+    outer["desc"].update(desc_panel)
+    return outer
+# ─────────────────────────────────────────────────────────────────────────────
+def render_audit(state: TerminalState, app: App, w: int, h: int) -> RenderableType:
+    rows = app.cache(f"audit_{state.audit_imputed_only}",
+                     lambda: app.audit_rows(state.audit_imputed_only))
+    cols = [
+        ("ISO", 5, lambda d: Text(d["iso"], style="bold cyan")),
+        ("YR", 5, lambda d: Text(str(d["year"]), style=DIM)),
+        ("INDICATOR", 22, lambda d: Text((d["indicator"] or "")[:22], style=TXT)),
+        ("SOURCE", 18, lambda d: Text((d["source"] or "")[:18],
+                                      style="green" if (d["source"] or "").startswith(("IMF", "World", "OECD")) else YELLOW)),
+        ("FLAG", 14, lambda d: Text(d["imputation_flag"] or "actual",
+                                    style=GREEN if (d["imputation_flag"] or "actual") == "actual"
+                                    else (RED if (d["imputation_flag"] or "") == "missing" else MAGENTA))),
+        ("RAW", 9, lambda d: Text(num_or_str(d["raw_value"]), style=DIM)),
+        ("FINAL", 9, lambda d: Text(num_or_str(d["final_value"]), style="bold white")),
+    ]
+    flt = "ESTIMATED/FALLBACK ONLY" if state.audit_imputed_only else "ALL PROVENANCE"
+    body = render_grid(state, app, f"DATA AUDIT — {flt}  (F toggles)",
+                       cols, rows, h - 7, sel=state.sel, subtitle="provenance")
+
+    # ETL quick-control strip (always visible under the audit grid)
+    quick = Table.grid(padding=(0, 1), expand=True)
+    for i, (title, argv, desc) in enumerate(AUDIT_QUICK):
+        tag = f"[{i + 1}]"
+        quick.add_row(Text(tag, style=CYAN), Text(title, style="bold white"),
+                      Text(desc, style=DIM))
+    quick_row = Panel(quick, title="ETL CONTROL — run in background (1-3)",
+                      border_style="grey30", box=box.SIMPLE, padding=(0, 1))
+
+    if rows:
+        return Group(body, quick_row)
+
+    notice = Panel(Text("data_audit is empty — provenance rows are written when the "
+                        "rating pipeline runs. Trigger ETL below (or System Control).",
+                        style=YELLOW), border_style="grey30", box=box.SIMPLE)
+    return Group(notice, quick_row)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Screen: System Control (ETL runner + status + live job console)
+# ─────────────────────────────────────────────────────────────────────────────
+def render_system(state: TerminalState, app: App, w: int, h: int) -> RenderableType:
+    actions = SYSTEM_ACTIONS
+    if state.sel >= len(actions):
+        state.sel = 0
+    inner = max(2, h - 8)
+    voff = max(0, min(state.vscroll, max(0, len(actions) - inner)))
+    vis = actions[voff:voff + inner]
+
+    t = Table.grid(padding=(0, 1), expand=True)
+    t.add_column(width=4, style=CYAN)
+    t.add_column(width=24, style="bold white")
+    t.add_column(style=DIM)
+    for i, (title, argv, desc) in enumerate(vis):
+        abs_i = voff + i
+        sel = abs_i == state.sel and state.focus == "content"
+        cmd = "paperflow " + " ".join(argv)
+        if sel:
+            t.add_row(f"[{abs_i + 1}]", title, cmd, style="bold black on bright_cyan")
+        else:
+            t.add_row(f"[{abs_i + 1}]", title, cmd)
+    actions_panel = Panel(t, title="PAPERFLOW CLI — ENTER runs · X kills job",
+                          border_style="grey30", box=box.SIMPLE, padding=(0, 1))
+
+    st = app.pool.status()
+    info = Table.grid(padding=(0, 1), expand=True)
+    info.add_column(style="bold cyan", width=14)
+    info.add_column(style=TXT)
+    info.add_row("binary", PAPERFLOW_CMD)
+    info.add_row("root", str(PAPERFLOW_DIR))
+    info.add_row("main db", f"{fmt_size(MAIN_DB.stat().st_size) if MAIN_DB.exists() else '—'} "
+                            f"({'LIVE' if st['main'] else 'MISSING'})")
+    info.add_row("gfcr db", f"{fmt_size(GFCR_DB.stat().st_size) if GFCR_DB.exists() else '—'} "
+                            f"({'LIVE' if st['gf'] else 'MISSING'})")
+    info.add_row("rating round", str(app.rating_year or "—"))
+    info.add_row("watchlist", f"{len(state.watch)} pinned")
+    info.add_row("exports", str(EXPORT_DIR))
+    info_panel = Panel(info, title="SYSTEM STATUS", border_style="grey30",
+                       box=box.SIMPLE, padding=(0, 1))
+
+    lay = Layout()
+    lay.split_column(
+        Layout(name="top", size=max(8, h - 12)),
+        Layout(name="bot", ratio=1),
+    )
+    lay["top"].split_row(Layout(name="actions", ratio=3), Layout(name="info", ratio=2))
+    lay["top"]["actions"].update(actions_panel)
+    lay["top"]["info"].update(info_panel)
+
+    # live job console
+    if state.job:
+        lines = list(state.job.lines)[- (h - 10):]
+        body = Text("\n".join(lines[-40:]), style="grey75") if lines else \
+            Text("(no output yet — waiting for the pipeline…)", style=DIM)
+        status = ("RUNNING" if state.job.running else f"EXIT {state.job.rc}")
+        job_panel = Panel(body, title=f"JOB CONSOLE — {state.job.title}  [{status}]",
+                          border_style=YELLOW if state.job.running else "grey30",
+                          box=box.SIMPLE, padding=(0, 1))
+        lay["bot"].update(job_panel)
+    else:
+        lay["bot"].update(Panel(Text("No job running — pick an action above and press "
+                                     "ENTER; output streams here live.", style=DIM),
+                                title="JOB CONSOLE", border_style="grey30",
+                                box=box.SIMPLE, padding=(0, 1)))
+    return lay
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Overlays: command palette / global search / watchlist / help
+# ─────────────────────────────────────────────────────────────────────────────
+def palette_index(app: App, state: TerminalState) -> list[dict]:
+    """Index of everything reachable: screens, ETL actions, countries."""
+    items: list[dict] = []
+    for i, s in enumerate(SCREENS):
+        items.append({"kind": "screen", "label": f"{s['icon']} go {s['name']}",
+                      "desc": "jump to screen", "screen": i})
+    for title, argv, desc in SYSTEM_ACTIONS:
+        items.append({"kind": "action", "label": f"⚙ {title}", "desc": desc,
+                      "argv": argv, "title": title})
+    for c in app.countries():
+        items.append({"kind": "country", "label": f"{c['iso']} — {c['name']}",
+                      "desc": "open sovereign deep-dive", "iso": c["iso"]})
+    items.append({"kind": "watchlist", "label": "◎ open watchlist", "desc": "F2"})
+    items.append({"kind": "export", "label": "⤓ export current view (CSV)", "desc": "E"})
+    items.append({"kind": "search", "label": "⌕ global database search", "desc": "Ctrl+F"})
+    return items
+
+
+def fuzzy_score(q: str, s: str) -> int:
+    """Subsequence fuzzy match: substring hits rank first, then subsequence."""
+    q, s = q.lower(), s.lower()
+    if not q:
+        return 0
+    if q in s:
+        return 100 + len(q)
+    pos, score = 0, 0
+    for ch in q:
+        i = s.find(ch, pos)
+        if i < 0:
+            return -1
+        score += 2 if i == pos else 1
+        pos = i + 1
+    return score
+
+
+def filter_palette(items: list[dict], q: str) -> list[dict]:
+    scored = []
+    for it in items:
+        sc = fuzzy_score(q, it["label"] + " " + it["desc"])
+        if sc >= 0:
+            scored.append((sc, it))
+    scored.sort(key=lambda x: -x[0])
+    return [it for _, it in scored[:25]]
+
+
+def render_palette(state: TerminalState, app: App, h: int) -> RenderableType:
+    items = filter_palette(palette_index(app, state), state.query)
+    state.results = items
+    if state.res_idx >= len(items):
+        state.res_idx = 0
+    inner = max(3, h - 6)
+    vis = items[:inner]
+    lines: list[RenderableType] = []
+    for i, it in enumerate(vis):
+        if i == state.res_idx:
+            lines.append(Text(f" ▶ {it['label']}", style=SEL))
+        else:
+            lines.append(Text(f"   {it['label']}", style=TXT))
+        lines.append(Text(f"      {it['desc']}", style=DIM))
+    return Panel(Group(*lines), title=f"COMMAND PALETTE — {len(items)} matches for "
+                                      f"\"{state.query}\"", title_align="left",
+                 border_style=MAGENTA, box=box.SIMPLE, padding=(0, 1))
+
+
+def global_search(app: App, needle: str) -> list[dict]:
+    pat = f"%{needle}%"
+    out: list[dict] = []
+    for r in app.pool.query(MAIN_DB,
+            "SELECT iso3, indicator_code, indicator_name, year FROM macro_indicators "
+            "WHERE indicator_name LIKE ? OR indicator_code LIKE ? OR iso3 LIKE ? LIMIT 40",
+            (pat, pat, pat)) or []:
+        out.append({"kind": "macro", "iso": r["iso3"],
+                    "label": f"[MACRO] {r['indicator_code']} — {r['indicator_name']}",
+                    "sub": f"{r['iso3']} {r['year']}"})
+    for r in app.pool.query(MAIN_DB,
+            "SELECT iso3, name FROM countries WHERE name LIKE ? OR iso3 LIKE ?",
+            (pat, pat)) or []:
+        out.append({"kind": "country", "iso": r["iso3"],
+                    "label": f"[CTY] {r['iso3']} — {r['name']}", "sub": "country"})
+    for r in app.pool.query(MAIN_DB,
+            "SELECT iso3, event_date, description FROM policy_events "
+            "WHERE description LIKE ? LIMIT 20", (pat,)) or []:
+        out.append({"kind": "policy", "iso": r["iso3"],
+                    "label": f"[POLICY] {r['iso3']} {r['event_date']}",
+                    "sub": (r["description"] or "")[:80]})
+    for r in app.pool.query(MAIN_DB,
+            "SELECT iso3, indicator, source, imputation_flag FROM data_audit "
+            "WHERE indicator LIKE ? OR source LIKE ? LIMIT 30", (pat, pat)) or []:
+        out.append({"kind": "audit", "iso": r["iso3"],
+                    "label": f"[AUDIT] {r['indicator']}",
+                    "sub": f"{r['iso3']} · {r['source']} · {r['imputation_flag']}"})
+    for r in app.pool.query(GFCR_DB,
+            "SELECT iso3, gfcr_tier, gfcr_score FROM country_ratings_gfcr "
+            "WHERE gfcr_tier LIKE ? OR iso3 LIKE ? LIMIT 20", (pat, pat)) or []:
+        out.append({"kind": "rating", "iso": r["iso3"],
+                    "label": f"[GFCR] {r['iso3']} {r['gfcr_score']} {r['gfcr_tier']}",
+                    "sub": "sovereign rating"})
+    return out[:60]
+
+
+def render_search(state: TerminalState, app: App, h: int) -> RenderableType:
+    if state.query:
+        state.results = global_search(app, state.query)
+    else:
+        state.results = []
+    if state.res_idx >= max(1, len(state.results)):
+        state.res_idx = 0
+    inner = max(3, h - 6)
+    vis = state.results[:inner]
+    lines: list[RenderableType] = []
+    for i, r in enumerate(vis):
+        if i == state.res_idx:
+            lines.append(Text(f" ▶ {r['label']}", style=SEL))
+        else:
+            lines.append(Text(f"   {r['label']}", style=TXT))
+        lines.append(Text(f"      {r['sub']}", style=DIM))
+    return Panel(Group(*lines), title=f"GLOBAL SEARCH — {len(state.results)} hits for "
+                                      f"\"{state.query}\" (Ctrl+F)", title_align="left",
+                 border_style=CYAN, box=box.SIMPLE, padding=(0, 1))
+
+
+def render_watchlist(state: TerminalState, app: App, h: int) -> RenderableType:
+    data = {d["iso"]: d for d in app.cache("matrix", app.matrix_data)}
+    iso_list = sorted(state.watch)
+    if state.res_idx >= len(iso_list):
+        state.res_idx = 0
+    inner = max(3, h - 6)
+    lines: list[RenderableType] = []
+    for i, iso in enumerate(iso_list[:inner]):
+        d = data.get(iso)
+        if i == state.res_idx:
+            line = Text(f" ▶ {iso}  ", style=SEL)
+        else:
+            line = Text(f"   {iso}  ", style="bold cyan")
+        if d:
+            line.append_text(score_cell(d["gfcr_score"]))
+            line.append(f"  {tier_short(d['gfcr_tier'])}  {d['name'][:28]}",
+                        style=TXT)
+        else:
+            line.append("no rating", style=DIM)
+        lines.append(line)
+    return Panel(Group(*lines),
+                 title=f"WATCHLIST ({len(iso_list)}) — Enter deep-dive · W unpin · Esc close",
+                 title_align="left", border_style=AMBER, box=box.SIMPLE, padding=(0, 1))
+
+
+def render_help(state: TerminalState, app: App, h: int) -> RenderableType:
+    keys = Table.grid(padding=(0, 2), expand=True)
+    keys.add_column(style="bold cyan", width=20, no_wrap=True)
+    keys.add_column(style=TXT)
+    for k, d in [
+        ("↑↓ / k j", "navigate · screens (nav) or rows (content)"),
+        ("Enter", "open deep-dive / run ETL action"),
+        ("Tab / →", "focus content ·  Esc / ← back to nav"),
+        ("1..6", "jump to screen (Dashboard … System Control)"),
+        ("s / S", "cycle matrix sort key / flip ascending-descending"),
+        ("< > , .", "horizontal scroll wide tables ( [ ] = page)"),
+        ("/ or :", "command palette — type country, action or screen"),
+        ("Ctrl+F", "global search across all paperflow tables"),
+        ("W", "pin / unpin current country on the watchlist"),
+        ("F2", "open the watchlist pane"),
+        ("F", "Data Audit: show estimated/fallback rows only"),
+        ("E", "export current view to CSV (+ clipboard if available)"),
+        ("X", "kill the running ETL job"),
+        ("r", "refresh — re-read both databases"),
+        ("q / Ctrl-C", "quit"),
+    ]:
+        keys.add_row(k, d)
+    return Panel(keys, title="KEY BINDINGS — BLOOMBERG-STYLE TERMINAL",
+                 title_align="left", border_style=CYAN, box=box.SIMPLE, padding=(0, 1))
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Screen assembly & drawing
+# ─────────────────────────────────────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────────────────────
+# Split-pane machinery. PANE_FIELDS are mirrored as p1_*/p2_* on TerminalState;
+# the live fields always hold the *focused* pane, so every existing handler and
+# renderer keeps working untouched. activate_pane() swaps mirrors on focus
+# changes; _pane_render() draws either side from its mirror for build_screen.
+# ─────────────────────────────────────────────────────────────────────────────
+def _pane_snap(state: TerminalState) -> dict:
+    return {f: getattr(state, f) for f in PANE_FIELDS}
+
+
+def _pane_restore(state: TerminalState, snap: dict) -> None:
+    for f, v in snap.items():
+        setattr(state, f, v)
+
+
+def activate_pane(state: TerminalState, target: int) -> None:
+    """Materialize pane `target` (1|2) into the live fields, parking the
+    outgoing pane in its mirror. Focus tokens: nav/content live on pane 1,
+    "pane2" focus lives on pane 2."""
+    if state.layout != "hsplit":
+        return
+    cur = 1 if state.focus in ("nav", "content") else 2
+    if cur == target:
+        return
+    snap = _pane_snap(state)                        # park outgoing pane
+    for f, v in snap.items():
+        setattr(state, f"p{cur}_{f}", v)
+    for f in PANE_FIELDS:                           # load incoming pane
+        setattr(state, f, getattr(state, f"p{target}_{f}"))
+
+
+def _pane_render(state: TerminalState, app: App, pane: int,
+                 w: int, h: int) -> RenderableType:
+    """Render one split pane from its mirror, leaving the live state intact.
+    The focused side gets the bright-cyan border + row highlight; the other
+    side renders inert (focus "inert" suppresses selection highlighting)."""
+    saved_focus = state.focus
+    snap = _pane_snap(state)
+    for f in PANE_FIELDS:
+        setattr(state, f, getattr(state, f"p{pane}_{f}"))
+    focused = (pane == 1 and state.focus != "pane2") or               (pane == 2 and state.focus == "pane2")
+    state.focus = "content" if focused else "inert"
+    try:
+        body = content_renderable(state, app, w, h)
+    finally:
+        state.focus = saved_focus
+        _pane_restore(state, snap)
+    return Panel(body, box=box.SQUARE,
+                 border_style="bright_cyan" if focused else "grey30",
+                 padding=(0, 0))
+
+
+def heat_bg(v: Optional[float]) -> str:
+    """Risk → background colour ramp: 0.0 bright green … 1.0 bright red."""
+    if v is None:
+        return ""
+    if v < 0.15:
+        return "on bright_green"
+    if v < 0.40:
+        return "on green"
+    if v < 0.60:
+        return "on yellow"
+    return "on bright_red"
+
+
+def render_matrix_heatmap(state: TerminalState, app: App, w: int, h: int) -> RenderableType:
+    """H-view: 40 countries × 11 GFCR modules — every cell is the module risk
+    (0-100%) painted on a green→red background. `<` `>` scroll the module
+    window horizontally (reusing the h_hscroll machinery); edge-to-edge table,
+    zero wasted padding."""
+    data = app.cache("heatmap", app.heatmap_data)
+    rows = sorted(data, key=lambda d: (d["name"] or "").lower())
+    state.order = [d["iso"] for d in rows]          # ENTER dives the right iso
+    if state.sel >= len(rows):
+        state.sel = 0
+    modules = GFCR_MODULES
+    inner = max(2, h - 3)
+    total = len(rows)
+    voff = max(0, min(state.vscroll, max(0, total - inner)))
+    vis = rows[voff:voff + inner]
+
+    # column budget: ISO + COUNTRY + as many 5-char cells as fit (no padding)
+    fixed = 5 + 13
+    cell_w = 5
+    per_page = max(1, (max(10, w) - fixed - 4) // (cell_w + 1))
+    offs = min(state.hscroll, max(0, len(modules) - per_page))
+    page = modules[offs:offs + per_page]
+
+    t = Table(box=None, expand=True, pad_edge=False, show_header=True,
+              header_style="bold yellow", padding=(0, 0))
+    t.add_column("ISO", width=5, no_wrap=True)
+    t.add_column("COUNTRY", width=13, no_wrap=True)
+    for mname, col, _wgt in page:
+        t.add_column(mname.split()[0][:5].upper(), width=cell_w,
+                     no_wrap=True, justify="center")
+    for i, d in enumerate(vis):
+        abs_i = voff + i
+        sel_here = abs_i == state.sel and state.focus == "content"
+        cells = [Text(("▸ " if sel_here else "  ") + d["iso"],
+                      style="bold black on bright_cyan" if sel_here else "bold cyan"),
+                 Text((d["name"] or "")[:13], style=TXT)]
+        for _mname, col, _w in page:
+            v = d.get(col)
+            if v is None:
+                cells.append(Text("·", style="grey30"))
+                continue
+            style = "black on bright_cyan" if sel_here else f"black {heat_bg(v)}"
+            cells.append(Text(f"{v * 100:3.0f}", style=style, justify="center"))
+        t.add_row(*cells)
+
+    sub = f"HEATMAP · {total} countries × {len(modules)} modules"
+    sub += f"   rows {voff + 1}-{min(voff + inner, total)}/{total}"
+    if offs + per_page < len(modules):
+        sub += (f"   modules {offs + 1}-{min(offs + per_page, len(modules))}"
+                f"/{len(modules)}  < >")
+    leg = Text(" 0% ", style=f"black {heat_bg(0.05)}")
+    leg.append(" 25% ", style=f"black {heat_bg(0.25)}")
+    leg.append(" 50% ", style=f"black {heat_bg(0.5)}")
+    leg.append(" 80%+ ", style=f"black {heat_bg(0.8)}")
+    return Panel(Group(t, Text(sub, style=DIM), leg),
+                 title="GFCR v6.0 — 11-MODULE RISK HEATMAP  (H toggles)",
+                 border_style="grey30", box=box.SIMPLE, padding=(0, 0))
+
+
+def content_renderable(state: TerminalState, app: App, w: int, h: int) -> RenderableType:
+    app.content_w = max(20, w - 8)   # usable grid width (borders/padding)
+    if state.mode == "palette":
+        return render_palette(state, app, h)
+    if state.mode == "search":
+        return render_search(state, app, h)
+    if state.mode == "watchlist":
+        return render_watchlist(state, app, h)
+    if state.mode == "help":
+        return render_help(state, app, h)
+    key = SCREENS[state.screen]["key"]
+    if key == "dashboard":
+        return render_dashboard(state, app, w, h)
+    if key == "matrix":
+        if state.matrix_heatmap:
+            return render_matrix_heatmap(state, app, w, h)
+        return render_matrix(state, app, w, h)
+    if key == "country":
+        return render_country(state, app, w, h)
+    if key == "policy":
+        return render_policy(state, app, w, h)
+    if key == "audit":
+        return render_audit(state, app, w, h)
+    if key == "system":
+        return render_system(state, app, w, h)
+    return Text("")
+
+
+def build_screen(state: TerminalState, app: App, cols: int, lines: int) -> Layout:
+    """Dynamic layout, always full-size:
+        line 0      live ticker tape (marquee)
+        lines 1-2   header band
+        body        nav rail + content  (content halves in hsplit mode)
+        last 4      command line · status · hints · OMNIBAR
+    """
+    root = Layout()
+    root.split_column(
+        Layout(name="tape", size=1),
+        Layout(name="header", size=2),
+        Layout(name="body", ratio=1),
+        Layout(name="footer", size=4),
+    )
+    root["tape"].update(render_ticker(state, cols))
+    root["header"].update(render_header(state, app, cols))
+    body_h = max(4, lines - 7)                       # 1 tape + 2 header + 4 footer
+
+    # the nav rail shrinks slightly in split mode (Bloomberg squeezes chrome)
+    nav_w = max(16, cols // 6) if state.layout == "hsplit" else max(20, cols // 5)
+    body = root["body"]
+
+    # modal overlays (palette/search/watchlist/help) draw full-width regardless
+    overlay = state.mode in ("palette", "search", "watchlist", "help")
+    if state.layout == "hsplit" and not overlay:
+        body.split_row(
+            Layout(name="nav", size=nav_w),
+            Layout(name="split", ratio=1),
+        )
+        cw = max(30, cols - nav_w)
+        split = body["split"]
+        split.split_row(Layout(name="left", ratio=1), Layout(name="right", ratio=1))
+        split["left"].update(_pane_render(state, app, 1, cw // 2, body_h))
+        split["right"].update(_pane_render(state, app, 2, cw - cw // 2, body_h))
+    else:
+        body.split_row(
+            Layout(name="nav", size=nav_w),
+            Layout(name="content", ratio=1),
+        )
+        body["content"].update(content_renderable(state, app, cols - nav_w, body_h))
+    body["nav"].update(render_nav(state, app, nav_w))
+    root["footer"].update(render_footer(state, app, cols))
+    return root
+
+
+def draw_screen(console: Console, renderable: RenderableType) -> None:
+    """Deterministic full-screen repaint: home cursor, redraw, clear below."""
+    with console.capture() as cap:
+        console.print(renderable, end="")
+    text = cap.get()
+    lines = text.split("\n")
+    if len(lines) > console.height:                  # defensive clip
+        lines = lines[:console.height]
+    out = "\r\n".join(lines).rstrip("\r\n")
+    sys.stdout.write("\x1b[H" + out + "\x1b[0J")
+    sys.stdout.flush()
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Key dispatch — a dictionary table mapping keys to handlers.
+# (The old mtui's megabyte-sized if/elif chain is gone.)
+# ─────────────────────────────────────────────────────────────────────────────
+Handler = Callable[[TerminalState, App], None]
+
+def sel_max(state: TerminalState, app: App) -> int:
+    """Maximum selection index for the current screen (0-based, inclusive)."""
+    key = SCREENS[state.screen]["key"]
+    if key == "matrix":
+        return max(0, len(state.order) - 1)
+    if key == "policy":
+        return max(0, len(app.cache("policy_events", app.policy_events)) - 1)
+    if key == "audit":
+        return max(0, len(app.cache(f"audit_{state.audit_imputed_only}",
+                                    lambda: app.audit_rows(state.audit_imputed_only))) - 1)
+    if key == "system":
+        return max(0, len(SYSTEM_ACTIONS) - 1)
+    return 0
+
+
+def scroll_max(state: TerminalState, app: App) -> int:
+    key = SCREENS[state.screen]["key"]
+    inner = max(2, state._vis_h - 4) if getattr(state, "_vis_h", 0) else 10
+    if key == "matrix":
+        return max(0, len(state.order) - inner)
+    if key == "policy":
+        return max(0, len(app.cache("policy_events", app.policy_events)) - inner)
+    if key == "audit":
+        return max(0, len(app.cache(f"audit_{state.audit_imputed_only}",
+                                    lambda: app.audit_rows(state.audit_imputed_only))) - inner)
+    if key == "system":
+        return max(0, len(SYSTEM_ACTIONS) - inner)
+    return 0
+
+
+# ── navigation ──────────────────────────────────────────────────────────────
+def h_move(state: TerminalState, app: App, d: int) -> None:
+    if state.focus == "nav":
+        state.screen = (state.screen + d) % len(SCREENS)
+        state.sel = 0
+        return
+    key = SCREENS[state.screen]["key"]
+    inner = max(2, (getattr(state, "_vis_h", None) or 10) - 4)
+    if key == "policy":                            # policy list uses policy_sel
+        n = len(app.cache("policy_events", app.policy_events))
+        if n:
+            state.policy_sel = max(0, min(state.policy_sel + d, n - 1))
+            if state.policy_sel < state.vscroll:
+                state.vscroll = state.policy_sel
+            if state.policy_sel >= state.vscroll + inner:
+                state.vscroll = state.policy_sel - inner + 1
+        return
+    mx = sel_max(state, app)
+    state.sel = max(0, min(state.sel + d, mx))
+    if state.sel < state.vscroll:
+        state.vscroll = state.sel
+    if state.sel >= state.vscroll + inner:
+        state.vscroll = state.sel - inner + 1
+
+
+def h_scroll(state: TerminalState, app: App, d: int, page: bool = False) -> None:
+    mx = scroll_max(state, app)
+    step = max(3, (getattr(state, "_vis_h", 10) or 10) // 2) if page else 1
+    state.vscroll = max(0, min(state.vscroll + d * step, mx))
+
+
+def h_hscroll(state: TerminalState, app: App, d: int, page: bool = False) -> None:
+    key = SCREENS[state.screen]["key"]
+    if key != "matrix":
+        return
+    widths = [2 + w for w in MATRIX_COL_WIDTHS]
+    k, acc = 0, 0
+    while k < len(widths) and acc + widths[k] <= app.content_w:
+        acc += widths[k]
+        k += 1
+    k = max(1, k)
+    mx = max(0, len(widths) - k)
+    step = k if page else 1
+    state.hscroll = max(0, min(state.hscroll + d * step, mx))
+
+
+def h_top(state: TerminalState, app: App) -> None:
+    if state.focus == "nav":
+        state.screen = 0
+        state.sel = 0
+    else:
+        state.sel = 0
+        state.vscroll = 0
+
+
+def h_bottom(state: TerminalState, app: App) -> None:
+    state.sel = sel_max(state, app)
+    state.vscroll = max(0, state.sel - 1)
+
+
+# ── mode / focus ────────────────────────────────────────────────────────────
+def h_focus_content(state: TerminalState, app: App) -> None:
+    if state.focus == "pane2":               # move to the left pane's content
+        activate_pane(state, 1)
+        state.focus = "content"
+    elif state.focus != "content":
+        state.focus = "content"
+
+
+def h_focus_nav(state: TerminalState, app: App) -> None:
+    if state.focus == "pane2":
+        activate_pane(state, 1)
+    state.focus = "nav"
+    if state.mode in ("palette", "search", "watchlist", "help"):
+        state.mode = "normal"
+
+
+def h_focus_cycle(state: TerminalState, app: App) -> None:
+    """Tab: nav rail → left pane → right pane → nav rail."""
+    if state.focus == "nav":
+        state.focus = "content"
+    elif state.focus == "content":
+        if state.layout == "hsplit":
+            activate_pane(state, 2)           # materialize the right pane
+            state.focus = "pane2"
+        else:
+            state.focus = "nav"
+    else:                                       # "pane2" → back to nav rail
+        activate_pane(state, 1)
+        state.focus = "nav"
+
+
+def h_enter(state: TerminalState, app: App) -> None:
+    if state.focus == "nav":
+        state.focus = "content"
+        return
+    key = SCREENS[state.screen]["key"]
+    if key == "matrix" and state.order:
+        iso = state.order[state.sel]
+        state.sel_iso = iso
+        state.screen = 2                       # Country Deep-Dive
+        app.log_action(f"open {iso}")
+        app.toast(f"{iso} deep-dive")
+    elif key == "audit":
+        # rows present: dive into the selected audit row's country
+        # table empty:   run the selected ETL quick action instead
+        rows = app.cache(f"audit_{state.audit_imputed_only}",
+                         lambda: app.audit_rows(state.audit_imputed_only))
+        if rows and 0 <= state.sel < len(rows):
+            state.sel_iso = rows[state.sel]["iso"]
+            state.screen = 2
+            app.toast(rows[state.sel]["iso"] + " deep-dive")
+        elif not rows and 0 <= state.sel < len(AUDIT_QUICK):
+            title, argv, _d = AUDIT_QUICK[state.sel]
+            app.run_job(title, argv)
+    elif key == "system":
+        if 0 <= state.sel < len(SYSTEM_ACTIONS):
+            title, argv, _d = SYSTEM_ACTIONS[state.sel]
+            app.run_job(title, argv)
+    elif key == "policy":
+        pass                                      # selection IS the detail pane
+
+
+def h_screen(state: TerminalState, app: App, idx: int) -> None:
+    state.screen = idx % len(SCREENS)
+    state.sel = 0
+    state.vscroll = 0
+    state.hscroll = 0
+
+
+def h_sort(state: TerminalState, app: App) -> None:
+    state.sort_key = SORT_KEYS[(SORT_KEYS.index(state.sort_key) + 1) % len(SORT_KEYS)]
+    state.sort_asc = False
+    app.log_action(f"sort {state.sort_key}")
+
+
+def h_sort_flip(state: TerminalState, app: App) -> None:
+    state.sort_asc = not state.sort_asc
+    app.log_action(f"sort {state.sort_key} {'asc' if state.sort_asc else 'desc'}")
+
+
+def h_toggle_watch(state: TerminalState, app: App) -> None:
+    key = SCREENS[state.screen]["key"]
+    iso = None
+    if key == "matrix" and state.order:
+        iso = state.order[state.sel]
+    elif key == "country":
+        iso = state.sel_iso
+    elif state.mode == "watchlist" and state.res_idx < len(sorted(state.watch)):
+        iso = sorted(state.watch)[state.res_idx]
+    if iso:
+        if iso in state.watch:
+            state.watch.discard(iso)
+            app.toast(f"★ unpinned {iso}")
+        else:
+            state.watch.add(iso)
+            app.toast(f"★ pinned {iso}")
+        app.save_watchlist()
+
+
+def h_audit_filter(state: TerminalState, app: App) -> None:
+    state.audit_imputed_only = not state.audit_imputed_only
+    app.bump()
+    app.toast("audit filter: " + ("ESTIMATED/missing ONLY" if state.audit_imputed_only else "ALL"))
+
+
+def h_export(state: TerminalState, app: App) -> None:
+    key = SCREENS[state.screen]["key"]
+    ts = time.strftime("%Y%m%d-%H%M%S")
+    rows = []
+    if key == "matrix":
+        data = app.cache("matrix", app.matrix_data)
+        rows = [("iso3", "country", "score", "tier", "s_eff", "fiscal", "ext", "dyn"),
+                *[(d["iso"], d["name"], d["gfcr_score"], d["gfcr_tier"], d["s_eff"],
+                   d["fiscal_stress"], d["external_vulnerability"], d["dynamical_stress"])
+                  for d in data]]
+    elif key == "audit":
+        rows = [("iso3", "year", "indicator", "source", "flag", "raw", "final"),
+                *[(d["iso"], d["year"], d["indicator"], d["source"],
+                   d["imputation_flag"], d["raw_value"], d["final_value"])
+                  for d in app.cache(f"audit_{state.audit_imputed_only}",
+                                     lambda: app.audit_rows(state.audit_imputed_only))]]
+    elif key == "policy":
+        events = app.cache("policy_events", app.policy_events)
+        rows = [("iso3", "event_date", "type", "description"),
+                *[(e["iso3"], e["event_date"], e["event_type"], e["description"])
+                  for e in events]]
+    elif key == "dashboard":
+        data = app.cache("matrix", app.matrix_data)
+        rows = [("iso3", "gfcr_score", "tier"), *[(d["iso"], d["gfcr_score"],
+                                                   d["gfcr_tier"]) for d in data]]
+    if not rows:
+        app.toast("nothing to export here")
+        return
+    path = EXPORT_DIR / f"{key}_{ts}.csv"
+    try:
+        with open(path, "w", newline="", encoding="utf-8") as fh:
+            csv.writer(fh).writerows(rows)
+    except OSError as exc:
+        log_error(f"export: {exc}")
+        app.toast("export failed — see error.log")
+        return
+    copy_clipboard(open(path).read())
+    msg = f"exported {len(rows) - 1} rows → {path.name}"
+    if copy_clipboard(""):
+        msg += " · clipboard"
+    app.toast(msg)
+    app.log_action(f"export {key}")
+
+
+def copy_clipboard(text: str) -> bool:
+    for tool in (["xclip", "-selection", "clipboard"], ["wl-copy"],
+                 ["xsel", "--clipboard", "--input"], ["pbcopy"]):
+        if not shutil.which(tool[0]):
+            continue
+        try:
+            p = subprocess.Popen(tool, stdin=subprocess.PIPE,
+                                 stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            p.communicate(text.encode("utf-8"), timeout=8)
+            return p.returncode == 0     # 0 = the tool really accepted the text
+        except Exception:
+            continue
+    return False
+
+
+def _copy_code() -> int:
+    """`mtui --code`: copy mtui's own full source to the clipboard.
+
+    Reads the script itself (including any new code), pushes it through the
+    first working clipboard tool, then — when a matching read-back tool is
+    installed — pastes it back and compares byte-for-byte so a truncated or
+    mangled copy is reported as an error instead of silently succeeding.
+    """
+    src = Path(__file__).resolve()
+    if not src.exists():
+        print(f"mtui --code: cannot find source at {src}", file=sys.stderr)
+        return 1
+    code = src.read_text(encoding="utf-8")
+    payload = code.encode("utf-8")
+    sha = hashlib.sha256(payload).hexdigest()
+    n_lines = code.count("\n") + 1
+
+    if not copy_clipboard(code):
+        print("mtui --code: no clipboard tool found (need xclip/wl-copy/xsel/pbcopy)",
+              file=sys.stderr)
+        return 1
+
+    print(f"mtui --code: copied {src} to clipboard")
+    print(f"  {n_lines} lines · {len(payload):,} bytes · sha256 {sha[:16]}…")
+
+    # ── round-trip verification: paste back with the same clipboard family ──
+    readback: list[str] | None = None
+    for tool in ([["wl-paste", "--no-newline"], ["wl-copy"]],
+                 [["xclip", "-selection", "clipboard", "-o"], ["xclip"]],
+                 [["xsel", "--clipboard", "--output"], ["xsel"]],
+                 [["pbpaste"], ["pbcopy"]]):
+        if shutil.which(tool[1][0]):          # we copied with this family
+            if shutil.which(tool[0][0]):      # its read-back tool exists
+                readback = tool[0]
+            break
+    if readback is None:
+        print("  ✓ copied (no read-back tool installed — paste to verify safely)")
+        return 0
+    try:
+        p = subprocess.Popen(readback, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+        got = p.communicate(timeout=8)[0].replace(b"\r\n", b"\n").replace(b"\r", b"\n")
+    except Exception as exc:
+        print(f"  ? read-back unavailable ({exc}) — paste to verify", file=sys.stderr)
+        return 0
+    # a trailing newline is often added/kept by clipboard tools — normalize it
+    got_n = got.rstrip(b"\n")
+    want_n = payload.rstrip(b"\n")
+    if got_n == want_n:
+        print(f"  ✓ verified: read back {len(got):,} bytes — ALL {n_lines} lines intact")
+        return 0
+    if not got:
+        print("  ✗ copy FAILED: nothing landed in the clipboard"
+              " (tool exited 0 but no data available).", file=sys.stderr)
+    else:
+        print("  ✗ MISMATCH: copied text differs from the source!"
+              f" (sent {len(payload):,} b, got {len(got):,} b)", file=sys.stderr)
+    return 1
+
+
+def h_refresh(state: TerminalState, app: App) -> None:
+    app.bump()
+    app.toast("↻ refreshed both databases " + time.strftime("%H:%M:%S"))
+    app.log_action("refresh")
+
+
+def h_quit(state: TerminalState, app: App) -> None:
+    state.quit = True
+
+
+def h_palette(state: TerminalState, app: App) -> None:
+    state.mode = "palette"
+    state.query = ""
+    state.res_idx = 0
+
+
+def h_search(state: TerminalState, app: App) -> None:
+    state.mode = "search"
+    state.query = ""
+    state.res_idx = 0
+
+
+def h_watchlist_overlay(state: TerminalState, app: App) -> None:
+    state.mode = "watchlist"
+    state.res_idx = 0
+
+
+def h_toggle_split(state: TerminalState, app: App) -> None:
+    """F9 — toggle the 50/50 side-by-side layout. Both mirrors are seeded from
+    the current screen, so the split starts as a clone you can diverge."""
+    if state.layout == "hsplit":
+        if state.focus == "pane2":           # park the right pane first
+            snap = _pane_snap(state)
+            for f, v in snap.items():
+                setattr(state, f"p2_{f}", v)
+        state.layout = "single"
+        state.focus = "nav"
+        app.toast("split OFF — single pane")
+    else:
+        snap = _pane_snap(state)
+        for f, v in snap.items():
+            setattr(state, f"p1_{f}", v)
+            setattr(state, f"p2_{f}", v)
+        state.layout = "hsplit"
+        state.focus = "nav"
+        app.toast("SPLIT ON — Tab cycles nav → left → right · 1..6 per pane")
+    app.log_action(("split off" if state.layout == "single" else "split on"))
+
+
+def _workspaces() -> list:
+    try:
+        if not WORKSPACES_PATH.exists():
+            return []
+        raw = json.loads(WORKSPACES_PATH.read_text())
+        return raw if isinstance(raw, list) else []
+    except (OSError, ValueError, json.JSONDecodeError) as exc:
+        log_error(f"workspaces load: {exc}")
+        return []
+
+
+def _ws_snapshot(state: TerminalState) -> dict:
+    """The whole multi-pane state in a portable dict."""
+    return {
+        "active": {f: getattr(state, f) for f in PANE_FIELDS},
+        "p1": {f: getattr(state, f"p1_{f}") for f in PANE_FIELDS},
+        "p2": {f: getattr(state, f"p2_{f}") for f in PANE_FIELDS},
+        "layout": state.layout,
+    }
+
+
+def h_workspace_save(state: TerminalState, app: App) -> None:
+    """F4: save both panes + layouts + cursors to ~/.mtui/workspaces.json."""
+    name = time.strftime("WS-%m%d-%H%M%S")
+    ws = _workspaces()
+    ws.insert(0, {"name": name, "snap": _ws_snapshot(state)})
+    del ws[12:]
+    try:
+        WORKSPACES_PATH.parent.mkdir(parents=True, exist_ok=True)
+        WORKSPACES_PATH.write_text(json.dumps(ws))
+    except OSError as exc:
+        log_error(f"workspace save: {exc}")
+        app.toast("workspace save FAILED — see error.log")
+        return
+    state.workspace_idx = 0
+    app.toast(f"workspace saved · {name}  (F3 cycles)")
+    app.log_action(f"save ws {name}")
+
+
+def h_workspace_cycle(state: TerminalState, app: App) -> None:
+    """F3: load the next saved workspace (rotating)."""
+    ws = _workspaces()
+    if not ws:
+        app.toast("no workspaces yet — F4 saves one")
+        return
+    state.workspace_idx = (max(0, state.workspace_idx) + 1) % len(ws)
+    snap = ws[state.workspace_idx]["snap"]
+    for f in PANE_FIELDS:
+        setattr(state, f, snap["active"][f])
+        setattr(state, f"p1_{f}", snap["p1"][f])
+        setattr(state, f"p2_{f}", snap["p2"][f])
+    state.layout = snap["layout"]
+    state.focus = "nav"
+    app.toast(f"loaded workspace {ws[state.workspace_idx]['name']}")
+    app.log_action("load ws")
+
+
+def h_heatmap(state: TerminalState, app: App) -> None:
+    """H: toggle the Macro Matrix between summary and 11-module heatmap."""
+    if SCREENS[state.screen]["key"] != "matrix":
+        app.toast("heatmap lives on the Macro Matrix screen (2)")
+        return
+    state.matrix_heatmap = not state.matrix_heatmap
+    state.hscroll = 0
+    app.toast("HEATMAP view" if state.matrix_heatmap else "SUMMARY view")
+    app.log_action("heatmap" if state.matrix_heatmap else "summary")
+
+
+def h_omni_focus(state: TerminalState, app: App) -> None:
+    """Spacebar: focus the OMNIBAR (bottom line)."""
+    state.mode = "omni"
+    state.omni_query = ""
+
+
+def _omni_exec(state: TerminalState, app: App) -> None:
+    """Bloomberg-style jump: ISO → dive; function code → screen; macro
+    indicator code → cross-country search; ticker → live quote toast."""
+    q = state.omni_query.strip().upper()
+    state.mode = "normal"
+    if not q:
+        return
+    # 1) exact ISO → deep-dive
+    iso3 = {d["iso"] for d in app.cache("matrix", app.matrix_data)}
+    if q in iso3:
+        state.sel_iso = q
+        state.screen = 2
+        app.toast(f"jump {q}")
+        app.log_action(f"omni {q}")
+        return
+    # 2) function code (MAT / DIV / AUD / SYS …)
+    if q in FUNC_CODES:
+        state.screen = FUNC_CODES[q]
+        state.sel = 0
+        app.toast(f"screen {SCREENS[state.screen]['name']}")
+        app.log_action(f"omni {q}")
+        return
+    # 3) macro indicator code → global search across all countries
+    if q in {c for _n, c, _k in MACRO_SERIES}:
+        state.mode = "search"
+        state.query = q
+        app.toast(f"macro indicator {q} — all countries")
+        return
+    # 4) plausible ticker (alphanumeric 1-6 chars) → live quote via yahoo
+    if q.isalnum() and len(q) <= 6:
+        app.fetch_quote(q)
+        app.toast(f"fetching {q}…")
+        return
+    app.toast(f"unknown omnibar token: {q}")
+
+
+def handle_omni_mode(state: TerminalState, app: App, key: str) -> None:
+    if key in ("ESC", "CTRL_C"):
+        state.mode = "normal"
+    elif key == "ENTER":
+        _omni_exec(state, app)
+    elif key == "BACKSPACE":
+        state.omni_query = state.omni_query[:-1]
+    elif key in ("UP", "DOWN", "TAB"):
+        return
+    elif len(key) == 1 and key.isprintable():
+        state.omni_query += key
+
+
+def h_help(state: TerminalState, app: App) -> None:
+    state.mode = "help"
+
+
+def h_reset_scroll(state: TerminalState, app: App) -> None:
+    state.sel = 0
+    state.vscroll = 0
+    state.hscroll = 0
+
+
+# ── the dispatch table (normal mode) ───────────────────────────────────────
+DISPATCH: dict[str, Handler] = {
+    "q": h_quit, "Q": h_quit, "CTRL_C": h_quit,
+    "r": h_refresh,
+    "UP": lambda s, a: h_move(s, a, -1),
+    "DOWN": lambda s, a: h_move(s, a, +1),
+    "PGUP": lambda s, a: h_scroll(s, a, -1, page=True),
+    "PGDN": lambda s, a: h_scroll(s, a, +1, page=True),
+    "HOME": h_top, "END": h_bottom,
+    "TAB": h_focus_cycle, "RIGHT": h_focus_content,
+    "BTAB": h_focus_nav, "LEFT": h_focus_nav, "ESC": h_focus_nav,
+    "ENTER": h_enter,
+    "/": h_palette, ":": h_palette,
+    "CTRL_F": h_search,
+    ",": lambda s, a: h_hscroll(s, a, -1),
+    "<": lambda s, a: h_hscroll(s, a, -1),
+    ".": lambda s, a: h_hscroll(s, a, +1),
+    ">": lambda s, a: h_hscroll(s, a, +1),
+    "[": lambda s, a: h_hscroll(s, a, -1, page=True),
+    "]": lambda s, a: h_hscroll(s, a, +1, page=True),
+    "s": h_sort, "S": h_sort_flip,
+    "H": h_heatmap,
+    " ": h_omni_focus,
+    "W": h_toggle_watch, "w": h_toggle_watch,
+    "F9": h_toggle_split,
+    "F3": h_workspace_cycle,
+    "F4": h_workspace_save,
+    "F": h_audit_filter,
+    "E": h_export,
+    "F2": h_watchlist_overlay,
+    "?": h_help, "h": h_help,
+    "X": lambda s, a: a.kill_job(),
+    "1": lambda s, a: h_screen(s, a, 0),
+    "2": lambda s, a: h_screen(s, a, 1),
+    "3": lambda s, a: h_screen(s, a, 2),
+    "4": lambda s, a: h_screen(s, a, 3),
+    "5": lambda s, a: h_screen(s, a, 4),
+    "6": lambda s, a: h_screen(s, a, 5),
+}
+VIM = {"k": "UP", "j": "DOWN", "K": "PGUP", "J": "PGDN", "g": "TOP", "G": "END"}
+
+
+def handle_prompt(state: TerminalState, app: App, key: str) -> None:
+    """Shared input handling for the command palette & global search mode."""
+    if key in ("ESC", "CTRL_C"):
+        state.mode = "normal"
+        return
+    if key == "ENTER":
+        if state.results:
+            state.res_idx = min(state.res_idx, len(state.results) - 1)
+        if state.mode == "palette" and state.results:
+            it = state.results[state.res_idx]
+            if it["kind"] == "screen":
+                state.screen = it["screen"]
+                state.sel = state.vscroll = 0
+            elif it["kind"] == "country":
+                state.sel_iso = it["iso"]
+                state.screen = 2
+            elif it["kind"] == "action":
+                app.run_job(it["title"], it["argv"])
+            elif it["kind"] == "watchlist":
+                state.mode = "watchlist"
+                state.res_idx = 0
+                return
+            elif it["kind"] == "export":
+                state.mode = "normal"
+                h_export(state, app)
+                return
+            elif it["kind"] == "search":
+                state.mode = "search"
+                state.query = ""
+                return
+            app.log_action(it["label"])
+            app.toast(it["label"])
+            state.mode = "normal"
+        elif state.mode == "search" and state.results:
+            r = state.results[state.res_idx]
+            if r.get("iso"):
+                state.sel_iso = r["iso"]
+                state.screen = 2
+                if r["kind"] == "policy":
+                    events = app.cache("policy_events", app.policy_events)
+                    for i, e in enumerate(events):
+                        if e["iso3"] == r["iso"]:
+                            state.policy_sel = i
+                            state.screen = 3
+                            break
+            state.mode = "normal"
+            app.toast("open " + r["label"])
+        return
+    if key in ("UP", "DOWN"):
+        n = len(state.results)
+        if n:
+            state.res_idx = (state.res_idx + (-1 if key == "UP" else 1)) % n
+        return
+    if key == "PGUP":
+        state.res_idx = max(0, state.res_idx - 6)
+        return
+    if key == "PGDN":
+        state.res_idx = min(len(state.results) - 1, state.res_idx + 6)
+        return
+    if key == "BACKSPACE":
+        state.query = state.query[:-1]
+        state.res_idx = 0
+        return
+    if len(key) == 1 and key.isprintable():
+        state.query += key
+        state.res_idx = 0
+        return
+
+
+def handle_watchlist_mode(state: TerminalState, app: App, key: str) -> None:
+    iso_list = sorted(state.watch)
+    if key in ("ESC", "CTRL_C"):
+        state.mode = "normal"
+    elif key == "ENTER" and iso_list:
+        state.sel_iso = iso_list[state.res_idx]
+        state.screen = 2
+        state.mode = "normal"
+    elif key in ("UP", "DOWN") and iso_list:
+        state.res_idx = (state.res_idx + (-1 if key == "UP" else 1)) % len(iso_list)
+    elif key in ("W", "w") and iso_list:
+        h_toggle_watch(state, app)
+        state.res_idx = min(state.res_idx, max(0, len(state.watch) - 1))
+    elif key in ("F2",):
+        state.mode = "normal"
+
+
+def handle_help_mode(state: TerminalState, app: App, key: str) -> None:
+    state.mode = "normal"
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# App::handle — the single routing point.
+# ─────────────────────────────────────────────────────────────────────────────
+def handle_key(state: TerminalState, app: App, key: Optional[str]) -> None:
+    if key is None:
+        return
+    key = VIM.get(key, key)
+    if state.mode == "palette" or state.mode == "search":
+        handle_prompt(state, app, key)
+        return
+    if state.mode == "watchlist":
+        handle_watchlist_mode(state, app, key)
+        return
+    if state.mode == "omni":
+        handle_omni_mode(state, app, key)
+        return
+    if state.mode == "help":
+        handle_help_mode(state, app, key)
+        return
+    fn = DISPATCH.get(key)
+    if fn is not None:
+        fn(state, app)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Terminal control: raw mode + alternate screen
+# ─────────────────────────────────────────────────────────────────────────────
+class Terminal:
+    def __init__(self) -> None:
+        self.fd = sys.stdin.fileno()
+        self._saved: Optional[list] = None
+        self._active = False
+
+    def enter(self) -> None:
+        if not sys.stdin.isatty():
+            raise RuntimeError("mtui needs an interactive terminal (TTY).")
+        self._saved = termios.tcgetattr(self.fd)
+        tty.setraw(self.fd)
+        attrs = termios.tcgetattr(self.fd)
+        attrs[1] |= termios.OPOST                     # \n -> \r\n
+        termios.tcsetattr(self.fd, termios.TCSADRAIN, attrs)
+        sys.stdout.write("\x1b[?1049h\x1b[?25l\x1b[2J\x1b[H")
+        sys.stdout.flush()
+        self._active = True
+
+    def exit_temp(self) -> None:
+        if self._active:
+            sys.stdout.write("\x1b[?25h\x1b[?1049l")
+            sys.stdout.flush()
+            if self._saved is not None:
+                termios.tcsetattr(self.fd, termios.TCSADRAIN, self._saved)
+            self._active = False
+
+    def reenter(self) -> None:
+        if not self._active and self._saved is not None:
+            tty.setraw(self.fd)
+            attrs = termios.tcgetattr(self.fd)
+            attrs[1] |= termios.OPOST
+            termios.tcsetattr(self.fd, termios.TCSADRAIN, attrs)
+            sys.stdout.write("\x1b[?1049h\x1b[?25l\x1b[2J\x1b[H")
+            sys.stdout.flush()
+            self._active = True
+
+    def restore(self) -> None:
+        sys.stdout.write("\x1b[?25h\x1b[?1049l")
+        sys.stdout.flush()
+        if self._saved is not None:
+            try:
+                termios.tcsetattr(self.fd, termios.TCSADRAIN, self._saved)
+            except (termios.error, OSError):
+                pass
+        self._active = False
+
+
+def read_key(timeout: float = 1.0) -> Optional[str]:
+    """Read one key: arrows, F-keys, Ctrl keys, or a literal character."""
+    fd = sys.stdin.fileno()
+    r, _, _ = select.select([fd], [], [], timeout)
+    if not r:
+        return None
+    try:
+        ch = os.read(fd, 1).decode(errors="replace")
+    except OSError:
+        return None
+    simple = {"A": "UP", "B": "DOWN", "C": "RIGHT", "D": "LEFT",
+              "H": "HOME", "F": "END", "Z": "BTAB"}
+    fn_o = {"P": "F1", "Q": "F2", "R": "F3", "S": "F4"}
+    fn_dig = {"1": "HOME", "4": "END", "7": "HOME", "8": "END", "11": "F1",
+              "12": "F2", "13": "F3", "14": "F4", "15": "F5", "17": "F6",
+              "18": "F7", "19": "F8", "20": "F9", "21": "F10", "23": "F11", "24": "F12"}
+    if ch == "\x1b":
+        r2, _, _ = select.select([fd], [], [], 0.04)
+        if not r2:
+            return "ESC"
+        ch2 = os.read(fd, 1).decode(errors="replace")
+        if ch2 in ("[", "O"):
+            r3, _, _ = select.select([fd], [], [], 0.04)
+            if not r3:
+                return "ESC"
+            ch3 = os.read(fd, 1).decode(errors="replace")
+            if ch2 == "[":
+                if ch3 in simple:
+                    return simple[ch3]
+                if ch3 in ("5", "6", "3"):          # PgUp / PgDn / Del
+                    r4, _, _ = select.select([fd], [], [], 0.04)
+                    if r4:                          # consume the trailing "~"
+                        os.read(fd, 1)
+                    return {"5": "PGUP", "6": "PGDN", "3": "DEL"}[ch3]
+                buf = ch3
+                r4, _, _ = select.select([fd], [], [], 0.04)
+                if r4:
+                    buf += os.read(fd, 1).decode(errors="replace")
+                return fn_dig.get(buf, "ESC")
+            else:                                    # OP..S = F1..F4
+                return fn_o.get(ch3, "ESC")
+        if ch2.isdigit():                            # \x1b1;5C etc — consume
+            digits = ch2
+            end = time.monotonic() + 0.08
+            while time.monotonic() < end:
+                r3, _, _ = select.select([fd], [], [], 0.008)
+                if not r3:
+                    break
+                c = os.read(fd, 1).decode(errors="replace")
+                digits += c
+                if c in "ABCD":
+                    return simple.get(c, "ESC")
+            return "ESC"
+        return "ESC"
+    return {
+        "\r": "ENTER", "\n": "ENTER", "\t": "TAB",
+        "\x7f": "BACKSPACE", "\x08": "BACKSPACE",
+        "\x03": "CTRL_C", "\x06": "CTRL_F",
+    }.get(ch, ch)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# main loop
+# ─────────────────────────────────────────────────────────────────────────────
+def term_size() -> tuple[int, int]:
+    """Current terminal size. A 0x0 pty (script/CI) falls back to a sane
+    canvas instead of rendering an empty frame."""
+    try:
+        sz = os.get_terminal_size(sys.stdout.fileno())
+        if sz.columns < 10 or sz.lines < 5:
+            return 100, 32
+        return sz.columns, sz.lines
+    except OSError:
+        return 100, 32
+
+
+def make_sig(state: TerminalState, app: App, cols: int, lines: int) -> tuple:
+    if state.toast and time.monotonic() - state.toast_t > 4.0:
+        state.toast = ""
+    j = state.job
+    job_sig = (j.title, j.rc, len(j.lines), bool(j.running)) if j else (None, None, 0, False)
+    mkt = (state.market_live,
+           tuple(sorted((k, v[0], v[1], v[2]) for k, v in state.market_data.items())))
+    p2 = (state.p2_screen, state.p2_sel, state.p2_sel_iso, state.p2_policy_sel,
+          state.p2_sort_key, state.p2_sort_asc, state.p2_hscroll, state.p2_vscroll,
+          state.p2_audit_imputed_only)
+    p1 = (state.p1_screen, state.p1_sel, state.p1_sel_iso, state.p1_policy_sel,
+          state.p1_sort_key, state.p1_sort_asc, state.p1_hscroll, state.p1_vscroll,
+          state.p1_audit_imputed_only)
+    return (cols, lines, state.screen, state.focus, state.sel, state.vscroll,
+            state.hscroll, state.sort_key, state.sort_asc, state.mode,
+            state.query, state.res_idx, len(state.results), state.audit_imputed_only,
+            state.sel_iso, state.policy_sel, tuple(sorted(state.watch)),
+            state.toast, int(time.time()), state.refresh, job_sig,
+            state.layout, state.matrix_heatmap, state.omni_query,
+            state.workspace_idx, p1, p2, mkt,
+            int(time.time() * TAPE_SPEED))
+
+
+def main() -> None:
+    args = sys.argv[1:]
+    if "--help" in args or "-h" in args:
+        print("mtui — Bloomberg-style sovereign rating terminal (paperflow GFCR v6.0)")
+        print(f"usage: mtui             launch the terminal (v{VERSION})")
+        print("       mtui --version    show version")
+        print("       mtui --code       copy mtui's full source code to the clipboard")
+        print("       mtui --offline    launch without the live market tape")
+        return
+    if "--version" in args:
+        print(f"mtui {VERSION}")
+        return
+    if "--code" in args:
+        sys.exit(_copy_code())
+    offline = "--offline" in args
+
+    if not (sys.stdin.isatty() and sys.stdout.isatty()) and not os.environ.get("MTUI_SMOKE"):
+        print("mtui needs an interactive terminal. Run it directly in your shell.",
+              file=sys.stderr)
+        sys.exit(2)
+    try:
+        import rich  # noqa: F401
+    except ImportError:
+        print("mtui requires the 'rich' library:  pip install rich", file=sys.stderr)
+        sys.exit(2)
+
+    app = App()
+    app.market_start(offline=offline)            # boot the ticker tape thread
+    if os.environ.get("MTUI_SMOKE"):
+        _smoke(app)
+        return
+
+    term = Terminal()
+    try:
+        term.enter()
+    except (RuntimeError, OSError) as exc:
+        print(f"mtui: {exc}", file=sys.stderr)
+        sys.exit(2)
+
+    state = app.s
+    last_sig = None
+    console = app.console
+    try:
+        while not state.quit:
+            cols, lines = term_size()
+            if app._last_size != (cols, lines):       # dynamic resize support
+                app._last_size = (cols, lines)
+                app.console = Console(force_terminal=True, highlight=False,
+                                      width=cols, height=lines, legacy_windows=False)
+                console = app.console
+            state._vis_h = max(10, lines - 7)      # tape+header+footer budget
+            sig = make_sig(state, app, cols, lines)
+            if sig != last_sig:
+                try:
+                    draw_screen(console, build_screen(state, app, cols, lines))
+                except Exception as exc:
+                    log_error(f"render: {exc}")
+                    state.toast = "render error — see ~/.mtui/error.log"
+                    state.toast_t = time.monotonic()
+                    try:
+                        draw_screen(console, Text("render error see log", style="red"))
+                    except OSError:
+                        pass
+                last_sig = sig
+            try:
+                key = read_key(timeout=1.0)
+            except Exception as exc:
+                # a key-decoder bug must never kill the terminal
+                log_error(f"read_key: {exc}")
+                state.toast = "key decode error — see ~/.mtui/error.log"
+                state.toast_t = time.monotonic()
+                key = None
+            if key is not None:
+                try:
+                    handle_key(state, app, key)
+                except Exception as exc:
+                    log_error(f"key {key!r}: {exc}")
+                    state.toast = "key error — see ~/.mtui/error.log"
+                    state.toast_t = time.monotonic()
+    except KeyboardInterrupt:
+        pass
+    finally:
+        term.restore()
+        app.market_stop()                      # stop the tape thread
+        app.pool.close()
+        print("mtui — bye. (Paperflow GFCR v6.0 Bloomberg terminal)")
+
+
+def _smoke(app: App) -> None:
+    """Headless render test: draw every screen/overlay to a fixed-size console."""
+    out = io.StringIO()
+    console = Console(width=120, height=40, force_terminal=True, file=out)
+    state = app.s
+    print("MTUI smoke test — rendering all screens at 120x40\n")
+    state.offline = True                       # deterministic: no network
+    for i, s in enumerate(SCREENS):
+        state.screen = i
+        state.mode = "normal"
+        try:
+            r = build_screen(state, app, 120, 40)
+            console.print(r)
+            lines = out.getvalue().count("\n") + 1
+            print(f"  screen {i} {s['key']:<12} rendered  ({lines} lines)")
+        except Exception as exc:
+            log_error(f"smoke {s['key']}: {exc}")
+            print(f"  screen {i} {s['key']:<12} FAILED: {exc}")
+        out.seek(0)
+        out.truncate()
+    # overlays
+    for mode, q in (("palette", "usa"), ("search", "debt"), ("watchlist", ""), ("help", "")):
+        state.mode = mode
+        state.query = q
+        try:
+            console.print(build_screen(state, app, 120, 40))
+            print(f"  overlay {mode:<12} rendered")
+        except Exception as e:
+            print(f"  overlay {mode} FAILED: {e}")
+        out.seek(0)
+        out.truncate()
+
+    # new features: heatmap, split panes, live tape (fake snapshot)
+    checks = [
+        ("heatmap",      lambda: setattr(state, "matrix_heatmap", True), "summary"),
+        ("split-panes",  lambda: setattr(state, "layout", "hsplit"), "single"),
+        ("split/pane2",  lambda: setattr(state, "focus", "pane2"), None),
+    ]
+    state.screen, state.mode = 1, "normal"
+    for label, mutate, back in checks:
+        mutate()
+        try:
+            console.print(build_screen(state, app, 120, 40))
+            print(f"  feature {label:<12} rendered")
+        except Exception as exc:
+            log_error(f"smoke {label}: {exc}")
+            print(f"  feature {label:<12} FAILED: {exc}")
+        if back:
+            setattr(state, "matrix_heatmap", False if back == "summary" else True)
+        if back == "split":
+            state.layout = "single"
+            state.focus = "nav"
+        out.seek(0)
+        out.truncate()
+    # tape with a fake snapshot (colours + marquee)
+    state.market_data = {"SPX": (5300.1, +12.3, 0.24), "VIX": (13.4, -0.8, -5.6),
+                         "US10Y": (4.22, 0.01, 0.2), "GOLD": (2550.0, 8.0, 0.3),
+                         "WTI": (82.1, -1.1, -1.3), "BTC": (97000, 1500, 1.6)}
+    state.market_live = True
+    state.offline = False
+    state.layout = "single"
+    state.focus = "nav"
+    try:
+        console.print(build_screen(state, app, 120, 40))
+        print("  feature tape          rendered (live snapshot)")
+    except Exception as e:
+        print(f"  feature tape FAILED: {e}")
+    print("\nsmoke complete.")
+
+
+if __name__ == "__main__":
+    main()
