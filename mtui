@@ -2623,6 +2623,15 @@ def h_move(state: TerminalState, app: App, d: int) -> None:
             if state.papertrade_sel >= state.vscroll + inner:
                 state.vscroll = state.papertrade_sel - inner + 1
         return
+    if key == "market":                            # market list uses market_sel
+        n = len(_market_items(state))
+        if n:
+            state.market_sel = max(0, min(state.market_sel + d, n - 1))
+            if state.market_sel < state.vscroll:
+                state.vscroll = state.market_sel
+            if state.market_sel >= state.vscroll + inner:
+                state.vscroll = state.market_sel - inner + 1
+        return
     mx = sel_max(state, app)
     state.sel = max(0, min(state.sel + d, mx))
     if state.sel < state.vscroll:
@@ -2657,11 +2666,38 @@ def h_top(state: TerminalState, app: App) -> None:
         state.screen = 0
         state.sel = 0
     else:
+        key = SCREENS[state.screen]["key"]
+        if key == "market":
+            state.market_sel = 0
+        elif key == "papertrade":
+            state.papertrade_sel = 0
+        elif key == "policy":
+            state.policy_sel = 0
         state.sel = 0
         state.vscroll = 0
 
 
 def h_bottom(state: TerminalState, app: App) -> None:
+    if state.focus == "nav":
+        state.screen = len(SCREENS) - 1
+        state.sel = 0
+        return
+    key = SCREENS[state.screen]["key"]
+    if key == "market":
+        state.market_sel = max(0, len(_market_items(state)) - 1)
+        if state.market_sel > 0:
+            state.vscroll = state.market_sel - 1
+        return
+    if key == "papertrade":
+        state.papertrade_sel = max(0, len(app.cache("pt_runs", app.papertrade_runs)) - 1)
+        if state.papertrade_sel > 0:
+            state.vscroll = state.papertrade_sel - 1
+        return
+    if key == "policy":
+        state.policy_sel = max(0, len(app.cache("policy_events", app.policy_events)) - 1)
+        if state.policy_sel > 0:
+            state.vscroll = state.policy_sel - 1
+        return
     state.sel = sel_max(state, app)
     state.vscroll = max(0, state.sel - 1)
 
