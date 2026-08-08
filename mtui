@@ -269,6 +269,7 @@ class TerminalState:
     layout: str = "single"                            # "single" | "hsplit"
     matrix_heatmap: bool = False                      # H toggles matrix view
     omni_query: str = ""                              # omnibar input buffer
+    _omni_mode: str = ""                             # omnibar contextual mode ("add_ticker")
     workspace_idx: int = -1
     nav_expanded: bool = False
     # per-pane mirrors (PANE_FIELDS below). The *active* fields hold whichever
@@ -3114,6 +3115,7 @@ def h_omni_focus(state: TerminalState, app: App) -> None:
     """Spacebar: focus the OMNIBAR (bottom line)."""
     state.mode = "omni"
     state.omni_query = ""
+    state._omni_mode = ""  # plain focus: no contextual mode
 
 
 def _omni_exec(state: TerminalState, app: App) -> None:
@@ -3121,6 +3123,24 @@ def _omni_exec(state: TerminalState, app: App) -> None:
     indicator code → cross-country search; ticker → live quote toast."""
     q = state.omni_query.strip().upper()
     state.mode = "normal"
+    if state._omni_mode == "add_ticker":
+        # live-markets "add custom ticker" flow (key 'a' on market screen)
+        state._omni_mode = ""
+        if not q:
+            app.toast("add ticker cancelled")
+            return
+        for _tag, sym, _lbl, _cat in TICKERS:
+            if _tag == q or sym == q:
+                app.toast(f"{q} is already in the default universe")
+                return
+        if any(t[0] == q for t in state.market_custom):
+            app.toast(f"{q} is already on the watch list")
+            return
+        state.market_custom.append((q, q, q, "CUSTOM"))
+        state.market_sel = 0
+        app.toast(f"added {q} to Live Markets")
+        app.log_action(f"mkt add {q}")
+        return
     if not q:
         return
     # 1) exact ISO → deep-dive
