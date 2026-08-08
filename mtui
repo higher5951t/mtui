@@ -97,6 +97,10 @@ WAREHOUSE = PAPERFLOW_DIR / "data" / "warehouse"
 MAIN_DB = WAREHOUSE / "paperflow.db"     # ETL hub: macro data, policy, audit
 GFCR_DB = WAREHOUSE / "gfcr.db"          # GFCR v6.0 formula snapshot + ratings
 
+# papertrade root: PAPERTRADE_DIR env wins, else $HOME/papertrade
+PAPERTRADE_DIR = Path(os.environ.get("PAPERTRADE_DIR", str(HOME / "papertrade"))).expanduser()
+PAPERTRADE_DB = PAPERTRADE_DIR / "data" / "papertrade.db"  # Paper trading ledger
+
 PAPERFLOW_CMD = shutil.which("paperflow") or str(PAPERFLOW_DIR / "venv" / "bin" / "paperflow")
 
 MTUI_DIR.mkdir(parents=True, exist_ok=True)
@@ -159,24 +163,26 @@ PANE_FIELDS: tuple[str, ...] = ("screen", "sel", "sel_iso", "policy_sel",
                                 "sort_key", "sort_asc", "hscroll", "vscroll",
                                 "audit_imputed_only")
 
-# Live ticker tape: (short tag, yahoo symbol, display label). Polled by the
-# MarketDaemon thread every MARKET_POLL seconds.
-TICKERS: tuple[tuple[str, str, str], ...] = (
-    ("SPX",   "^GSPC",    "S&P 500"),
-    ("VIX",   "^VIX",     "VOLATILITY"),
-    ("US10Y", "^TNX",     "US 10Y"),
-    ("DXY",   "DX-Y.NYB", "DOLLAR IDX"),
-    ("GOLD",  "GC=F",     "GOLD"),
-    ("WTI",   "CL=F",     "CRUDE WTI"),
-    ("BTC",   "BTC-USD",  "BITCOIN"),
+# Live ticker tape: (short tag, yahoo symbol, display label, category).
+# Polled by the MarketDaemon thread every MARKET_POLL seconds.
+TICKERS: tuple[tuple[str, str, str, str], ...] = (
+    # (short tag, yahoo symbol, display label, category)
+    ("SPX",   "^GSPC",    "S&P 500",        "EQ-IDX"),
+    ("VIX",   "^VIX",     "Volatility",     "VOL"),
+    ("US10Y", "^TNX",     "US 10Y Yield",   "SOV-YLD"),
+    ("US02Y", "^IRX",     "US 02Y Yield",   "SOV-YLD"),
+    ("DXY",   "DX-Y.NYB", "Dollar Index",   "FX"),
+    ("GOLD",  "GC=F",     "Gold",           "COMMODITY"),
+    ("WTI",   "CL=F",     "Crude WTI",      "COMMODITY"),
+    ("BTC",   "BTC-USD",  "Bitcoin",        "CRYPTO"),
 )
 MARKET_POLL = 15          # seconds between yahoo polls
 TAPE_SPEED = 2            # marquee chars shifted per second
 
 # Omnibar function codes — Bloomberg-style screen jump words.
 FUNC_CODES: dict[str, int] = {
-    "DASH": 0, "MAT": 1, "DIV": 2, "POL": 3, "AUD": 4, "SYS": 5,
-    "MD": 1, "CD": 2, "PE": 3, "DA": 4, "SC": 5,
+    "DASH": 0, "MAT": 1, "DIV": 2, "POL": 3, "AUD": 4, "SYS": 5, "MKT": 6, "PPT": 7,
+    "MD": 1, "CD": 2, "PE": 3, "DA": 4, "SC": 5, "MK": 6, "PT": 7,
 }
 WORKSPACES_PATH = Path.home() / ".mtui" / "workspaces.json"
 
@@ -202,6 +208,8 @@ SCREENS: list[dict] = [
     {"key": "policy",    "name": "Policy Events",     "short": "Policy Events","icon": "≡"},
     {"key": "audit",     "name": "Data Audit",        "short": "Data Audit",  "icon": "⚠"},
     {"key": "system",    "name": "System Control",    "short": "System Ctl",  "icon": "⚙"},
+    {"key": "market",    "name": "Live Markets",      "short": "Live Markets","icon": "◉"},
+    {"key": "papertrade","name": "Paper Trade",       "short": "Paper Trade", "icon": "₿"},
 ]
 
 SORT_KEYS = ["score", "country", "tier", "fisc", "ext", "dyn"]
@@ -246,15 +254,23 @@ class TerminalState:
     job: Optional["Job"] = None
     quit: bool = False
     # ── live market tape (written by the MarketDaemon thread) ─────────
-    market_data: dict = field(default_factory=dict)   # ticker tag → (px, chg, pct)
+    market_data: dict = field(default_factory=dict)   # ticker tag → rich dict (px/chg/pct/history/…)
     market_live: bool = False                         # at least one poll landed
     market_err: str = ""                              # why the tape is offline
+    market_last_err: str = ""                         # sticky last per-poll error
+    market_sel: int = 0                               # selected ticker in market screen
+    market_sort: str = "default"                      # default | px | chg | pct | name
+    market_detail: bool = True                        # show right detail pane
+    market_custom: list = field(default_factory=list) # user-added (tag, sym, label, cat) tuples
+    market_filter_cat: str = ""                       # "" = all, else category filter
+    papertrade_sel: int = 0                           # selected backtest run in papertrade screen
     offline: bool = False                             # --offline flag
     # ── split-pane workspace + matrix heatmap + omnibar ───────────────
     layout: str = "single"                            # "single" | "hsplit"
     matrix_heatmap: bool = False                      # H toggles matrix view
     omni_query: str = ""                              # omnibar input buffer
     workspace_idx: int = -1
+    nav_expanded: bool = False
     # per-pane mirrors (PANE_FIELDS below). The *active* fields hold whichever
     # pane has focus; p1_*/p2_* are the passive copies used to swap panes.
     p1_screen: int = 0
@@ -332,7 +348,7 @@ class DBPool:
                     except sqlite3.Error:
                         pass
                     self._conns.pop(db, None)
-                    if attempt == 1:
+                    if attempt == 2:
                         log_error(f"DB query failed {db}: {exc}")
                         return None
 
@@ -381,22 +397,26 @@ class MarketDaemon(threading.Thread):
 
     def run(self) -> None:
         try:
-            import yfinance as yf          # lazy: degrades to OFFLINE tape
+            import yfinance as yf
             import pandas as pd
         except ImportError:
             self.state.offline = True
             self.state.market_err = "yfinance not installed"
             return
-        symbols = [t[1] for t in TICKERS]
+        symbols = [t[1] for t in TICKERS] + [t[1] for t in self.state.market_custom]
         while not self._stop.is_set():
             try:
-                df = yf.download(tickers=symbols, period="2d", interval="1d",
-                                 progress=False, group_by="ticker", threads=8)
+                df = yf.download(tickers=symbols, period="6mo", interval="1d",
+                                 progress=False, group_by="ticker", threads=4)
                 if df is None or df.empty or df.shape[0] < 1:
                     raise RuntimeError("empty download")
-                for tag, sym, _label in TICKERS:
+                all_tickers = list(TICKERS) + list(self.state.market_custom)
+                for tag, sym, label, category in all_tickers:
                     try:
                         sub = df[sym] if isinstance(df.columns, pd.MultiIndex) else df
+                        if sub.empty: continue
+                        # NaN-safe: the multi-symbol frame contains rows for
+                        # sessions with no trade (NaN). Drop them everywhere.
                         closes = sub["Close"].dropna()
                         if closes.empty:
                             continue
@@ -404,12 +424,61 @@ class MarketDaemon(threading.Thread):
                         prev = float(closes.iloc[-2]) if closes.size > 1 else px
                         chg = px - prev
                         pct = chg / prev * 100.0 if prev else 0.0
-                        self.state.market_data[tag] = (px, chg, pct)
+
+                        history = [float(x) for x in closes.tolist()]
+                        ohlc = []
+                        for i in range(len(sub)):
+                            o = float(sub["Open"].iloc[i]); hh = float(sub["High"].iloc[i])
+                            ll = float(sub["Low"].iloc[i]); cc = float(sub["Close"].iloc[i])
+                            if not (o == o and hh == hh and ll == ll and cc == cc):
+                                continue          # skip NaN/zero-volume sessions
+                            vv = float(sub["Volume"].iloc[i]) if "Volume" in sub else 0.0
+                            ohlc.append({"o": o, "h": hh, "l": ll, "c": cc,
+                                         "v": vv if vv == vv else 0.0})
+
+                        hi_col = sub["High"].dropna()
+                        lo_col = sub["Low"].dropna()
+                        op_col = sub["Open"].dropna()
+                        vo_col = sub["Volume"].dropna() if "Volume" in sub else pd.Series(dtype=float)
+                        day_high = float(hi_col.iloc[-1]) if len(hi_col) else px
+                        day_low  = float(lo_col.iloc[-1]) if len(lo_col) else px
+                        open_px  = float(op_col.iloc[-1]) if len(op_col) else px
+                        vol      = float(vo_col.iloc[-1]) if len(vo_col) else 0.0
+
+                        fetch_info = tag not in self.state.market_data or not self.state.market_data[tag].get("market_cap")
+                        mkt_cap, ma50, ma200 = 0.0, 0.0, 0.0
+                        if fetch_info:
+                            try:
+                                fi = yf.Ticker(sym).fast_info
+                                mkt_cap = float(fi.get("market_cap", 0) or 0)
+                                ma50 = float(fi.get("fifty_day_average", 0) or 0)
+                                ma200 = float(fi.get("two_hundred_day_average", 0) or 0)
+                            except Exception:
+                                pass
+                        else:
+                            d = self.state.market_data.get(tag, {})
+                            mkt_cap = d.get("market_cap", 0.0)
+                            ma50 = d.get("ma50", 0.0)
+                            ma200 = d.get("ma200", 0.0)
+
+                        self.state.market_data[tag] = {
+                            "px": px, "chg": chg, "pct": pct,
+                            "prev_close": prev, "open": open_px,
+                            "day_high": day_high, "day_low": day_low,
+                            "volume": vol, "history": history, "ohlc": ohlc,
+                            "label": label, "symbol": sym, "category": category,
+                            "market_cap": mkt_cap, "ma50": ma50, "ma200": ma200,
+                            "high_6m": max(history) if history else px,
+                            "low_6m": min(history) if history else px,
+                        }
                         self.state.market_live = True
-                    except (KeyError, TypeError, ValueError, IndexError):
-                        continue            # per-symbol failure: skip, keep old
-            except Exception as exc:        # network / yahoo outage
+                        self.state.market_last_err = ""
+                    except (KeyError, TypeError, ValueError, IndexError) as exc:
+                        self.state.market_last_err = f"{tag}: {exc}"[:80]
+                        continue
+            except Exception as exc:
                 self.state.market_err = str(exc)[:90]
+                self.state.market_last_err = self.state.market_err
             if not self._stop.is_set():
                 self._stop.wait(MARKET_POLL)
 
@@ -470,7 +539,7 @@ class Job:
 # ─────────────────────────────────────────────────────────────────────────────
 class App:
     def __init__(self) -> None:
-        self.pool = DBPool([MAIN_DB, GFCR_DB])
+        self.pool = DBPool([MAIN_DB, GFCR_DB, PAPERTRADE_DB])
         self.s = TerminalState()
         self.console = Console(force_terminal=True, highlight=False)
         self.action_log: deque[str] = deque(maxlen=2)   # footer "last actions"
@@ -543,7 +612,8 @@ class App:
 
     def fetch_quote(self, tick: str) -> None:
         """One-shot Yahoo quote (omnibar ticker): result arrives as a toast.
-        Runs in a daemon thread so a slow network never blocks the UI."""
+        Also adds the ticker to state.market_custom so it persists for the
+        Live Markets screen session."""
         def work() -> None:
             try:
                 import yfinance as yf
@@ -551,16 +621,63 @@ class App:
                 self.toast(f"{tick}: no yfinance (offline)")
                 return
             try:
-                h = yf.Ticker(tick).history(period="5d")
+                t = yf.Ticker(tick)
+                h = t.history(period="6mo", interval="1d")
                 closes = h["Close"].dropna()
                 if closes.empty:
                     raise ValueError("no data")
                 px = float(closes.iloc[-1])
                 prev = float(closes.iloc[-2]) if closes.size > 1 else px
                 chg, pct = px - prev, (px - prev) / prev * 100 if prev else 0.0
-                self.toast(f"{tick}  {px:,.2f}  {chg:+,.2f}  ({pct:+,.1f}%)")
-            except Exception:
-                self.toast(f"{tick}: quote unavailable")
+                history = [float(x) for x in closes.tolist()]
+                ohlc = []
+                for i in range(len(h)):
+                    o = float(h["Open"].iloc[i]); hh = float(h["High"].iloc[i])
+                    ll = float(h["Low"].iloc[i]); cc = float(h["Close"].iloc[i])
+                    if not (o == o and hh == hh and ll == ll and cc == cc):
+                        continue                    # skip NaN sessions
+                    v = float(h["Volume"].iloc[i])
+                    ohlc.append({"o": o, "h": hh, "l": ll, "c": cc,
+                                 "v": v if v == v else 0.0})
+
+                mkt_cap, ma50, ma200 = 0.0, 0.0, 0.0
+                try:
+                    fi = t.fast_info
+                    mkt_cap = float(fi.get("market_cap", 0) or 0)
+                    ma50 = float(fi.get("fifty_day_average", 0) or 0)
+                    ma200 = float(fi.get("two_hundred_day_average", 0) or 0)
+                except Exception:
+                    pass
+                info = {}
+                try:
+                    info = t.info or {}
+                except Exception:
+                    pass
+                label = info.get("shortName", tick)
+                category = info.get("quoteType", "EQ")
+                # persist into market_data + custom list (idempotent)
+                op_c = h["Open"].dropna(); hi_c = h["High"].dropna()
+                lo_c = h["Low"].dropna(); vo_c = h["Volume"].dropna()
+                self.s.market_data[tick.upper()] = {
+                    "px": px, "chg": chg, "pct": pct,
+                    "prev_close": prev,
+                    "open": float(op_c.iloc[-1]) if len(op_c) else px,
+                    "day_high": float(hi_c.iloc[-1]) if len(hi_c) else px,
+                    "day_low": float(lo_c.iloc[-1]) if len(lo_c) else px,
+                    "volume": float(vo_c.iloc[-1]) if len(vo_c) else 0.0,
+                    "history": history, "ohlc": ohlc,
+                    "label": label, "symbol": tick.upper(), "category": category,
+                    "market_cap": mkt_cap, "ma50": ma50, "ma200": ma200,
+                    "high_6m": max(history) if history else px,
+                    "low_6m": min(history) if history else px,
+                }
+                self.s.market_live = True
+                if not any(t[0] == tick.upper() for t in self.s.market_custom):
+                    self.s.market_custom.append((tick.upper(), tick.upper(), label, category))
+                self.toast(f"{tick}  {px:,.2f}  {chg:+,.2f}  ({pct:+,.1f}%)  → added to Live Markets")
+            except Exception as exc:
+                log_error(f"fetch_quote {tick}: {exc}")
+                self.toast(f"{tick}: quote unavailable ({str(exc)[:40]})")
         threading.Thread(target=work, daemon=True, name="QuoteFetch").start()
 
     # ── ETL job runner ──────────────────────────────────────────────────
@@ -685,6 +802,42 @@ class App:
             out.append((name, b, a, delta))
         return out
 
+    # ── papertrade loaders ─────────────────────────────────────────────
+    def papertrade_runs(self) -> list[dict]:
+        if not PAPERTRADE_DB.exists():
+            return []
+        rows = self.pool.query(PAPERTRADE_DB,
+            "SELECT id, run_date, signal_type, start_year, end_year, capital, "
+            "total_return, sharpe, sortino, max_drawdown, hit_rate, "
+            "alpha_vs_benchmark, beta_vs_benchmark, n_positions, payload "
+            "FROM paper_backtests ORDER BY id DESC")
+        out = []
+        for r in rows or []:
+            d = dict(r)
+            try:
+                d["payload"] = json.loads(d.get("payload") or "{}")
+            except json.JSONDecodeError:
+                d["payload"] = {}
+            out.append(d)
+        return out
+
+    def papertrade_nav(self, bt_id: int) -> list[dict]:
+        if not PAPERTRADE_DB.exists():
+            return []
+        rows = self.pool.query(PAPERTRADE_DB,
+            "SELECT date, nav, benchmark FROM paper_nav WHERE backtest_id=? "
+            "ORDER BY date", (bt_id,))
+        return [dict(r) for r in (rows or [])]
+
+    def papertrade_positions(self, bt_id: int) -> list[dict]:
+        if not PAPERTRADE_DB.exists():
+            return []
+        rows = self.pool.query(PAPERTRADE_DB,
+            "SELECT iso3, ticker, direction, shares, entry_price, entry_date "
+            "FROM paper_positions WHERE backtest_id=? ORDER BY direction DESC, iso3",
+            (bt_id,))
+        return [dict(r) for r in (rows or [])]
+
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Formatting helpers
@@ -765,6 +918,7 @@ def risk_cell(v: Optional[float], nd: int = 0) -> Text:
 
 def sparkline8(vals: list[float], width: int = 7) -> Text:
     """ASCII micro-chart ▁▂▃▄▅▆▇█ over the observed range (Bloomberg spark)."""
+    vals = [v for v in vals if v == v]      # NaN never renders: drop NaN samples
     if not vals:
         return Text("·" * width, style=DIM)
     if len(vals) == 1:                     # only one rating round so far
@@ -839,43 +993,51 @@ def pad_pair(left: Text, right: Text, width: int) -> Text:
 # Rendering — the Bloomberg canvas
 # ─────────────────────────────────────────────────────────────────────────────
 def render_ticker(state: TerminalState, cols: int) -> RenderableType:
-    """Line 0 — the live market marquee.
+    """Line 0 — compact market status pip (full data on Live Markets screen).
 
-    Quotes are pulled from state.market_data (written by the MarketDaemon).
-    The window slides TAPE_SPEED chars/second using the wall clock, so the
-    dirty-check sig tuple picks the movement up at the normal repaint cadence
-    (no extra timer, no busy redraw). Green = up, red = down, trading-floor
-    style. OFFLINE is shown when --offline / no yfinance / no internet.
+    Replaces the old scrolling marquee. Shows up to 6 ticker chips with
+    price + %chg in 1 line, plus a LIVE/OFFLINE/CONNECTING badge. Click into
+    the Live Markets screen (7 / MKT) for OHLC, history charts, and detail.
     """
+    line = Text()
     if state.offline:
-        return Text("  TAPE OFFLINE — live market disabled (--offline)"
-                    + "─" * max(0, cols - 45), style="grey30")
+        line.append(" ◉ MKT ", style="bold grey30")
+        line.append("OFFLINE ", style="bold red")
+        line.append("— press 7 for Live Markets screen", style="grey30")
+        line.append(" " * max(0, cols - len(line.plain)), style="grey30")
+        return line
     if not state.market_live:
-        msg = f"  TAPE — connecting to yahoo finance…  {state.market_err}"
-        return Text(msg[:cols].ljust(cols), style="bold yellow")
-    quotes: list[Text] = []
-    for tag, _sym, label in TICKERS:
-        if tag not in state.market_data:
+        line.append(" ◉ MKT ", style="bold yellow")
+        line.append("CONNECTING ", style="bold yellow")
+        err = state.market_err or state.market_last_err
+        if err:
+            line.append(f"({err[:60]})", style="grey50")
+        line.append(" " * max(0, cols - len(line.plain)), style="grey30")
+        return line
+    # live: show compact chips for first 6 tickers
+    line.append(" ◉ MKT ", style="bold green")
+    line.append("LIVE ", style="bold bright_green")
+    shown = 0
+    for tag, _sym, _label, _cat in TICKERS:
+        if shown >= 6:
+            break
+        d = state.market_data.get(tag)
+        if not d:
             continue
-        px, chg, pct = state.market_data[tag]
-        up = pct >= 0
-        q = Text(f"  {label:<11}", style="bold cyan")
-        q.append(f"{px:>9.1f}", style="bold white")
-        q.append(f" {chg:>+7.1f} {pct:>+5.1f}%",
-                 style="bold bright_green" if up else "bold bright_red")
-        quotes.append(q)
-    if not quotes:
-        return Text("  TAPE — awaiting market data…".ljust(cols), style=DIM)
-    tape = Text("▐", style="grey30")
-    for q in quotes:
-        tape.append_text(q)
-    tape.append("▌", style="grey30")
-    total = len(tape)
-    big = tape + tape + tape                        # triple copy: seamless wrap
-    off = int(time.time() * TAPE_SPEED) % total     # char-exact marquee slide
-    line = big[off:off + cols]                      # Text slicing keeps styles
-    if len(line) < cols:
-        line.append_text(Text(" " * (cols - len(line)), style=DIM))
+        up = d["pct"] >= 0
+        line.append(f" {tag} ", style="bold cyan")
+        line.append(f"{d['px']:>9.2f}", style="bold white")
+        line.append(f" {d['pct']:>+5.2f}%",
+                    style="bright_green" if up else "bright_red")
+        shown += 1
+    n_extra = max(0, len([t for t in TICKERS if t[0] in state.market_data]) - 6)
+    if n_extra:
+        line.append(f"  +{n_extra} more (7→screen)", style="grey50")
+    # pad / clip
+    if len(line.plain) < cols:
+        line.append(" " * (cols - len(line.plain)), style="grey30")
+    elif len(line.plain) > cols:
+        line = line[:cols]
     return line
 
 
@@ -904,29 +1066,41 @@ def render_header(state: TerminalState, app: App, cols: int) -> RenderableType:
 
 
 def render_nav(state: TerminalState, app: App, width: int) -> RenderableType:
-    """Left rail (≈15%): the six functional screens + mini status footer."""
+    """Left rail: functional screens + mini status footer. Expands on focus."""
     grid = Table.grid(padding=(0, 1), expand=True)
     grid.add_column(ratio=1)
+    expanded = width > 20
+
     for i, s in enumerate(SCREENS):
         active, focused = (i == state.screen), (i == state.screen and state.focus == "nav")
         label = s.get("short", s["name"]).upper()
-        row = Text()
-        if focused:                                   # reverse-video selector
-            row.append(f" {s['icon']} {label} ", style=SEL)
-        elif active:
-            row.append(f" {s['icon']} ", style=AMBER)
-            row.append(label, style=f"bold {AMBER}")
-            row.append(" ◀", style=CYAN)
+        if expanded:
+            row = Text()
+            if focused:
+                row.append(f" {s['icon']} {label} ", style=SEL)
+            elif active:
+                row.append(f" {s['icon']} ", style=AMBER)
+                row.append(label, style=f"bold {AMBER}")
+                row.append(" ◀", style=CYAN)
+            else:
+                row.append(f" {s['icon']} ", style=DIM)
+                row.append(label, style=TXT)
         else:
-            row.append(f" {s['icon']} ", style=DIM)
-            row.append(label, style=TXT)
+            # Collapsed mode: icon only
+            if focused:
+                row = Text(f" {s['icon']} ", style=SEL)
+            elif active:
+                row = Text(f" {s['icon']} ", style=f"bold {AMBER}")
+            else:
+                row = Text(f" {s['icon']} ", style=DIM)
         grid.add_row(row)
 
-    grid.add_row(Text("", style=DIM))
-    watch_n = len(state.watch)
-    grid.add_row(Text(f"{len(app.countries())} countries · {app.alert_count()} alerts",
-                      style=DIM))
-    grid.add_row(Text(f"watch {watch_n} · round {app.rating_year or '—'}", style=DIM))
+    if expanded:
+        grid.add_row(Text("", style=DIM))
+        watch_n = len(state.watch)
+        grid.add_row(Text(f"{len(app.countries())} countries · {app.alert_count()} alerts",
+                          style=DIM))
+        grid.add_row(Text(f"watch {watch_n} · round {app.rating_year or '—'}", style=DIM))
     return Panel(grid, box=box.SQUARE, border_style="grey23", padding=(0, 0))
 
 
@@ -964,9 +1138,9 @@ def render_footer(state: TerminalState, app: App, cols: int) -> RenderableType:
 
     # line 3 — contextual keybinding hint
     hints = {
-        "normal": "↑↓ nav · Enter act · Tab focus · 1-6 · s sort · H heatmap · "
+        "normal": "↑↓ nav · Enter act · Tab focus · 1-8 screens · s sort · H heatmap · "
                   "< > h-scroll · W pin · E export · / palette · SPACE omni · "
-                  "F9 split · F3/F4 ws",
+                  "F9 split · F3/F4 ws · 8=Paper Trade",
         "palette": "type to filter · ↑↓ pick · Enter run · Esc cancel",
         "search": "type to search DB · ↑↓ pick · Enter open · Esc cancel",
         "watchlist": "↑↓ pick · Enter deep-dive · W unpin · Esc close",
@@ -1550,6 +1724,436 @@ def render_system(state: TerminalState, app: App, w: int, h: int) -> RenderableT
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# Screen: Live Markets (Yahoo Finance integrated panel)
+# ─────────────────────────────────────────────────────────────────────────────
+def _market_items(state: TerminalState) -> list[tuple[str, dict]]:
+    """Return (tag, data_dict) pairs in current sort/filter order."""
+    items = []
+    all_tickers = list(TICKERS) + list(state.market_custom)
+    for tag, _sym, _label, _cat in all_tickers:
+        d = state.market_data.get(tag)
+        if d is None:
+            continue
+        if state.market_filter_cat and d.get("category", "") != state.market_filter_cat:
+            continue
+        items.append((tag, d))
+    sk = state.market_sort
+    if sk == "px":
+        items.sort(key=lambda x: x[1]["px"], reverse=True)
+    elif sk == "chg":
+        items.sort(key=lambda x: x[1]["chg"], reverse=True)
+    elif sk == "pct":
+        items.sort(key=lambda x: x[1]["pct"], reverse=True)
+    elif sk == "name":
+        items.sort(key=lambda x: x[1]["label"].lower())
+    # "default" preserves TICKERS declaration order
+    return items
+
+
+def _market_ascii_chart(history: list[float], w: int, h: int) -> Text:
+    """Render a 30-day close-history ASCII line chart into a Text block."""
+    if not history or len(history) < 2:
+        return Text("  (insufficient history for chart)", style=DIM)
+    lo, hi = min(history), max(history)
+    if hi - lo < 1e-9:
+        return Text("  (flat series)", style=DIM)
+    rows = max(4, h - 2)
+    cols = max(20, w - 4)
+    # downsample to `cols` points
+    step = max(1, len(history) // cols)
+    pts = history[::step][:cols]
+    grid = [[" "] * cols for _ in range(rows)]
+    for x, v in enumerate(pts):
+        y = int((1 - (v - lo) / (hi - lo)) * (rows - 1))
+        y = max(0, min(rows - 1, y))
+        grid[y][x] = "●"
+        # connect with vertical bars to previous point
+        if x > 0:
+            prev_v = pts[x - 1]
+            prev_y = int((1 - (prev_v - lo) / (hi - lo)) * (rows - 1))
+            prev_y = max(0, min(rows - 1, prev_y))
+            for yy in range(min(prev_y, y) + 1, max(prev_y, y)):
+                grid[yy][x] = "│"
+    out = Text()
+    for r, row in enumerate(grid):
+        # y-axis label on first column
+        if r == 0:
+            out.append(f"{hi:>9.2f} ┤", style=DIM)
+        elif r == rows - 1:
+            out.append(f"{lo:>9.2f} ┤", style=DIM)
+        elif r == rows // 2:
+            mid = (hi + lo) / 2
+            out.append(f"{mid:>9.2f} ┤", style=DIM)
+        else:
+            out.append(" " * 10 + "│", style=DIM)
+        out.append("".join(row), style=CYAN)
+        out.append("\n")
+    return out
+
+
+def _render_candlestick_chart(ohlc: list[dict], w: int, h: int) -> Text:
+    """Render an ASCII candlestick chart from OHLCV data."""
+    if not ohlc or len(ohlc) < 2:
+        return Text("  (insufficient history for chart)", style=DIM)
+
+    max_candles = max(10, (w - 15) // 2)
+    candles = [c for c in ohlc
+               if c.get("o") == c.get("o") and c.get("h") == c.get("h")
+               and c.get("l") == c.get("l") and c.get("c") == c.get("c")][-max_candles:]
+    if len(candles) < 2:
+        return Text("  (insufficient history)", style=DIM)
+
+    lo = min(c['l'] for c in candles)
+    hi = max(c['h'] for c in candles)
+    if hi - lo < 1e-9:
+        return Text("  (flat series)", style=DIM)
+
+    rows = max(8, h - 2)
+    grid: list[list[tuple[str, str]]] = [[(" ", DIM) for _ in range(len(candles)*2)] for _ in range(rows)]
+
+    def y_pos(val):
+        return max(0, min(rows - 1, int((1 - (val - lo) / (hi - lo)) * (rows - 1))))
+
+    for i, c in enumerate(candles):
+        x = i * 2
+        y_h = y_pos(c['h'])
+        y_l = y_pos(c['l'])
+        y_o = y_pos(c['o'])
+        y_c = y_pos(c['c'])
+
+        up = c['c'] >= c['o']
+        body_char = "█" if up else "░"
+        wick_char = "│"
+        body_color = "bright_green" if up else "bright_red"
+        wick_color = "green" if up else "red"
+
+        for y in range(min(y_h, y_l), max(y_h, y_l) + 1):
+            grid[y][x] = (wick_char, wick_color)
+
+        y_top = min(y_o, y_c)
+        y_bot = max(y_o, y_c)
+        if y_top == y_bot:
+            grid[y_top][x] = ("─", "yellow")
+        else:
+            for y in range(y_top, y_bot + 1):
+                grid[y][x] = (body_char, body_color)
+
+    out = Text()
+    for r in range(rows):
+        if r == 0:
+            out.append(f"{hi:>9.2f} ┤", style=DIM)
+        elif r == rows - 1:
+            out.append(f"{lo:>9.2f} ┤", style=DIM)
+        elif r == rows // 2:
+            mid = (hi + lo) / 2
+            out.append(f"{mid:>9.2f} ┤", style=DIM)
+        else:
+            out.append(" " * 10 + "│", style=DIM)
+        for x in range(len(candles) * 2):
+            char, color = grid[r][x]
+            out.append(char, style=color)
+        out.append("\n")
+    return out
+
+
+def _day_range_bar(low: float, high: float, curr: float, width: int = 24) -> Text:
+    """Visual indicator for where the current price sits in the day's range."""
+    if not (low == low and high == high and curr == curr) or high <= low:
+        return Text("—")
+    pos = int((curr - low) / (high - low) * (width - 1))
+    pos = max(0, min(width - 1, pos))
+    t = Text(f"{low:>9.2f} ", style=DIM)
+    t.append("┣", style=DIM)
+    for i in range(width - 2):
+        if i == pos:
+            t.append("●", style="bold yellow")
+        else:
+            t.append("━", style=DIM)
+    t.append("┫", style=DIM)
+    t.append(f" {high:.2f}", style=DIM)
+    return t
+
+
+def _ma_gauge(ma50: float, ma200: float, px: float, width: int = 24) -> Text:
+    """Visual indicator for MA50/MA200 crossover relative to price."""
+    if not (ma50 > 0 and ma200 > 0): return Text("—")
+    lo = min(px, ma50, ma200)
+    hi = max(px, ma50, ma200)
+    if hi - lo < 1e-9: return Text("—")
+
+    def pos(val):
+        return max(0, min(width - 1, int((val - lo) / (hi - lo) * (width - 1))))
+    p_px, p_50, p_200 = pos(px), pos(ma50), pos(ma200)
+
+    t = Text(f"{lo:>9.2f} ", style=DIM)
+    t.append("┣", style=DIM)
+    for i in range(width - 2):
+        if i == p_px: t.append("●", style="bold yellow")
+        elif i == p_50: t.append("5", style="bright_green")
+        elif i == p_200: t.append("2", style="bright_red")
+        else: t.append("━", style=DIM)
+    t.append("┫", style=DIM)
+    t.append(f" {hi:.2f}", style=DIM)
+    return t
+
+
+def render_market(state: TerminalState, app: App, w: int, h: int) -> RenderableType:
+    """Live Markets — Bloomberg-style market monitor with advanced visuals."""
+    # ── header / status ─────────────────────────────────────────────────
+    if state.offline:
+        return Panel(
+            Group(Text("MARKET OFFLINE — launch without --offline to enable Yahoo Finance.",
+                       style="bold red"),
+                  Text(f"  last error: {state.market_err or state.market_last_err or '—'}",
+                       style=DIM)),
+            title="◉ LIVE MARKETS", border_style="red", box=box.SIMPLE)
+    if not state.market_live:
+        return Panel(
+            Group(Text("CONNECTING TO YAHOO FINANCE…", style="bold yellow"),
+                  Text(f"  poll interval: {MARKET_POLL}s · {len(TICKERS)+len(state.market_custom)} symbols",
+                       style=DIM),
+                  Text(f"  last error: {state.market_err or '—'}", style=DIM),
+                  Text("  tip: install yfinance (pip install yfinance) for live data.",
+                       style=DIM)),
+            title="◉ LIVE MARKETS", border_style="yellow", box=box.SIMPLE)
+
+    items = _market_items(state)
+    if not items:
+        return Panel(Text("awaiting first poll…", style=DIM),
+                     title="◉ LIVE MARKETS", border_style="grey30", box=box.SIMPLE)
+
+    state.market_sel = max(0, min(state.market_sel, len(items) - 1))
+
+    # ── left pane: dense quote table with visual day range ─────────────
+    inner = max(2, h - 4)
+    total = len(items)
+    voff = max(0, min(state.vscroll, max(0, total - inner)))
+    vis = items[voff:voff + inner]
+
+    left = Table(box=box.SIMPLE, expand=True, show_header=True,
+                 header_style="bold yellow", padding=(0, 1), pad_edge=False)
+    left.add_column("TICKER", width=8, no_wrap=True)
+    left.add_column("LAST", width=10, justify="right", no_wrap=True)
+    left.add_column("CHG", width=9, justify="right", no_wrap=True)
+    left.add_column("%CHG", width=8, justify="right", no_wrap=True)
+    left.add_column("6M SPARK", width=20, no_wrap=True)  # Widened for advanced view
+    left.add_column("DAY RANGE", width=24, no_wrap=True)
+    left.add_column("VOL", width=10, justify="right", no_wrap=True)
+
+    for i, (tag, d) in enumerate(vis):
+        abs_i = voff + i
+        sel = abs_i == state.market_sel and state.focus == "content"
+        up = d["pct"] >= 0
+        cells = [
+            Text(tag, style="bold black on bright_cyan" if sel else "bold cyan"),
+            Text(f"{d['px']:,.2f}", style="bold black on bright_cyan" if sel else "bold white"),
+            Text(f"{d['chg']:+,.2f}",
+                 style=("black on bright_cyan" if sel else
+                        ("bright_green" if up else "bright_red"))),
+            Text(f"{d['pct']:+.2f}%",
+                 style=("black on bright_cyan" if sel else
+                        ("bright_green" if up else "bright_red"))),
+            sparkline8(d.get("history", []), 18),  # Wider spark
+            _day_range_bar(d.get("day_low", d['px']), d.get("day_high", d['px']), d['px']),
+            Text(hum(d.get("volume", 0)) if d.get("volume", 0) > 0 else "—", style=DIM),
+        ]
+        left.add_row(*cells)
+
+    sub = f"{voff + 1}-{min(voff + inner, total)}/{total}"
+    sort_lbl = {"default": "TICKER ORDER", "px": "PRICE", "chg": "CHANGE",
+                "pct": "%CHANGE", "name": "NAME"}[state.market_sort]
+    sub += f"  ·  SORT {sort_lbl}  [s] cycle"
+    if state.market_filter_cat:
+        sub += f"  ·  FILTER {state.market_filter_cat}  [c] clear"
+    left_panel = Panel(left, title="◉ LIVE MARKETS — GLOBAL TAPE",
+                       subtitle=sub, subtitle_align="right",
+                       border_style="bright_cyan" if state.focus == "content" else "grey30",
+                       box=box.SIMPLE, padding=(0, 0))
+
+    # ── right pane: detail of selected ticker ───────────────────────────
+    sel_tag, sel_d = items[state.market_sel]
+    detail_w = max(30, (w - 4) // 2)
+    chart_h = max(8, h // 2)
+    chart = _render_candlestick_chart(sel_d.get("ohlc", []), detail_w, chart_h)
+
+    stats = Table.grid(padding=(0, 2), expand=True)
+    stats.add_column(style="bold cyan", width=12, no_wrap=True)
+    stats.add_column(style=TXT)
+    stats.add_column(style="bold cyan", width=12, no_wrap=True)
+    stats.add_column(style=TXT)
+
+    stats.add_row("last", f"{sel_d['px']:,.2f}",
+                  "prev close", f"{sel_d.get('prev_close', sel_d['px']):,.2f}")
+    stats.add_row("open", f"{sel_d.get('open', sel_d['px']):,.2f}",
+                  "change", f"{sel_d['chg']:+,.2f} ({sel_d['pct']:+.2f}%)")
+    stats.add_row("day high", f"{sel_d.get('day_high', sel_d['px']):,.2f}",
+                  "day low", f"{sel_d.get('day_low', sel_d['px']):,.2f}")
+    stats.add_row("6m high", f"{sel_d.get('high_6m', sel_d['px']):,.2f}",
+                  "6m low", f"{sel_d.get('low_6m', sel_d['px']):,.2f}")
+    stats.add_row("volume", hum(sel_d.get("volume", 0)) if sel_d.get("volume", 0) else "—",
+                  "mkt cap", fmt_size(sel_d.get("market_cap", 0)) if sel_d.get("market_cap", 0) else "—")
+    stats.add_row("ma50", f"{sel_d.get('ma50', 0):,.2f}" if sel_d.get('ma50') else "—",
+                  "ma200", f"{sel_d.get('ma200', 0):,.2f}" if sel_d.get('ma200') else "—")
+
+    ret_6m = "—"
+    hist = sel_d.get("history", [])
+    if hist and len(hist) > 1 and hist[0] > 0:
+        ret_6m = f"{(hist[-1] - hist[0]) / hist[0] * 100:+.2f}%"
+    stats.add_row("6m return", ret_6m,
+                  "category", sel_d.get("category", "—"))
+
+    detail_body = Group(
+        Text(f" {sel_tag} — {sel_d.get('label', '')}", style="bold white"),
+        Text(f" Yahoo symbol: {sel_d.get('symbol', '—')}", style=DIM),
+        Text(""),
+        chart,
+        Text(""),
+        stats,
+        Text(""),  # Spacing
+        Text(" MA CROSSOVER (● Price · 5 MA50 · 2 MA200)", style="bold cyan"),
+        _ma_gauge(sel_d.get('ma50', 0), sel_d.get('ma200', 0), sel_d['px']),
+    )
+    right_panel = Panel(detail_body,
+                        title=f"DETAIL — {sel_tag}",
+                        border_style="grey30", box=box.SIMPLE, padding=(0, 1))
+
+    lay = Layout()
+    lay.split_row(
+        Layout(name="left", ratio=3),
+        Layout(name="right", ratio=2),
+    )
+    lay["left"].update(left_panel)
+    lay["right"].update(right_panel)
+    return lay
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Screen: Paper Trade (Backtest verification)
+# ─────────────────────────────────────────────────────────────────────────────
+def _render_nav_chart(nav_rows: list[dict], w: int, h: int) -> RenderableType:
+    """Render NAV vs Benchmark ASCII chart using plotext."""
+    if not nav_rows or len(nav_rows) < 2:
+        return Panel(Text("Insufficient NAV data to chart.", style=DIM),
+                     title="NAV CURVE", border_style="grey30", box=box.SIMPLE)
+    try:
+        import plotext as plt
+    except ImportError:
+        return Panel(Text("Install plotext for NAV chart.", style=DIM),
+                     title="NAV CURVE", border_style="grey30", box=box.SIMPLE)
+
+    dates = [r["date"] for r in nav_rows]
+    navs = [float(r["nav"]) for r in nav_rows]
+    bench = [float(r["benchmark"]) for r in nav_rows]
+
+    plt.clf()
+    plt.clc()
+    plt.theme("dark")
+    plt.plotsize(max(20, w - 4), max(6, h - 4))
+    plt.date_form("Y-m-d")          # NAV dates arrive as ISO strings (2026-08-03)
+    plt.plot(dates, navs, color="green", label="Strategy NAV")
+    plt.plot(dates, bench, color="yellow", label="SPY Benchmark")
+    plt.title("NAV vs SPY (Buy & Hold)")
+    plt.grid(0)
+
+    return Panel(Text.from_ansi(plt.build()), border_style="grey30",
+                 box=box.SIMPLE, padding=(0, 0))
+
+
+def render_papertrade(state: TerminalState, app: App, w: int, h: int) -> RenderableType:
+    """Paper Trade — backtest runs, NAV curve, and module attribution."""
+    runs = app.cache("pt_runs", app.papertrade_runs)
+    if not runs:
+        return Panel(Group(
+            Text("No papertrade runs found.", style="bold yellow"),
+            Text("  Run `papertrade --backtest` from your shell to generate results.", style=DIM),
+            Text(f"  (Expected DB at: {PAPERTRADE_DB})", style=DIM)
+        ), title="₿ PAPER TRADE", border_style="grey30", box=box.SIMPLE)
+
+    if state.papertrade_sel >= len(runs):
+        state.papertrade_sel = 0
+    sel_run = runs[state.papertrade_sel]
+
+    # ── left pane: backtest runs list ──────────────────────────────────
+    inner = max(2, h - 4)
+    voff = max(0, min(state.vscroll, max(0, len(runs) - inner)))
+    vis = runs[voff:voff + inner]
+
+    left = Table(box=box.SIMPLE, expand=True, show_header=True,
+                 header_style="bold yellow", padding=(0, 1), pad_edge=False)
+    left.add_column("ID", width=4, no_wrap=True)
+    left.add_column("DATE", width=12, no_wrap=True)
+    left.add_column("SIGNAL", width=16, no_wrap=True)
+    left.add_column("YRS", width=10, no_wrap=True)
+    left.add_column("RET%", width=8, justify="right", no_wrap=True)
+    left.add_column("SHARPE", width=8, justify="right", no_wrap=True)
+
+    for i, r in enumerate(vis):
+        abs_i = voff + i
+        sel = abs_i == state.papertrade_sel and state.focus == "content"
+        style = "bold black on bright_cyan" if sel else ""
+        ret = r.get("total_return", 0) or 0
+        ret_style = "bright_green" if ret >= 0 else "bright_red"
+        cells = [
+            Text(str(r["id"]), style=style or "bold cyan"),
+            Text(str(r["run_date"])[:10], style=style or DIM),
+            Text(r["signal_type"], style=style or TXT),
+            Text(f"{r['start_year']}-{r['end_year']}", style=style or TXT),
+            Text(f"{ret * 100:+.2f}%", style=style or ret_style),
+            Text(f"{r.get('sharpe', 0):.2f}", style=style or TXT),
+        ]
+        left.add_row(*cells)
+
+    left_panel = Panel(
+        left, title="₿ BACKTEST RUNS",
+        subtitle=f"{voff + 1}-{min(voff + inner, len(runs))}/{len(runs)}",
+        border_style="bright_cyan" if state.focus == "content" else "grey30",
+        padding=(0, 0))
+
+    # ── right pane: selected run details ───────────────────────────────
+    nav_rows = app.cache(f"pt_nav_{sel_run['id']}",
+                         lambda: app.papertrade_nav(sel_run["id"]))
+    positions = app.cache(f"pt_pos_{sel_run['id']}",
+                          lambda: app.papertrade_positions(sel_run["id"]))
+
+    chart = _render_nav_chart(nav_rows, w // 2, h // 2)
+
+    stats = Table.grid(padding=(0, 2), expand=True)
+    stats.add_column(style="bold cyan", width=12)
+    stats.add_column(style=TXT)
+    stats.add_column(style="bold cyan", width=12)
+    stats.add_column(style=TXT)
+    stats.add_row("capital", f"${sel_run['capital']:,.0f}",
+                  "hit rate", f"{(sel_run.get('hit_rate') or 0) * 100:.1f}%")
+    stats.add_row("max dd", f"{(sel_run.get('max_drawdown') or 0) * 100:.2f}%",
+                  "sortino", f"{sel_run.get('sortino') or 0:.2f}")
+    stats.add_row("alpha", f"{(sel_run.get('alpha_vs_benchmark') or 0) * 100:+.2f}%",
+                  "beta", f"{(sel_run.get('beta_vs_benchmark') or 0):.2f}")
+    stats.add_row("positions", str(sel_run.get("n_positions", 0)),
+                  "signal", sel_run["signal_type"])
+
+    # attribution from the stored JSON payload
+    attr = sel_run.get("payload", {}).get("attribution", [])
+    attr_text = Text("MODULE ATTRIBUTION (Spearman vs Fwd Ret):\n", style="bold cyan")
+    if attr:
+        for a in attr[:4]:
+            attr_text.append(f"  {a['module']:<22} ρ={a['spearman']:+.3f} "
+                             f"(p={a['p_value']:.3f})\n", style="grey85")
+    else:
+        attr_text.append("  (none computed)\n", style=DIM)
+
+    detail_body = Group(chart, Text(""), stats, Text(""), attr_text)
+    right_panel = Panel(detail_body,
+                        title=f"DETAIL — Run #{sel_run['id']} ({sel_run['signal_type']})",
+                        border_style="grey30", box=box.SIMPLE, padding=(0, 1))
+
+    lay = Layout()
+    lay.split_row(Layout(name="left", ratio=2), Layout(name="right", ratio=3))
+    lay["left"].update(left_panel)
+    lay["right"].update(right_panel)
+    return lay
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # Overlays: command palette / global search / watchlist / help
 # ─────────────────────────────────────────────────────────────────────────────
 def palette_index(app: App, state: TerminalState) -> list[dict]:
@@ -1707,6 +2311,13 @@ def render_help(state: TerminalState, app: App, h: int) -> RenderableType:
         ("Enter", "open deep-dive / run ETL action"),
         ("Tab / →", "focus content ·  Esc / ← back to nav"),
         ("1..6", "jump to screen (Dashboard … System Control)"),
+        ("7 / MKT", "Live Markets screen — Yahoo Finance integrated panel"),
+        ("8 / PPT", "Paper Trade screen — backtest runs, NAV curve, attribution"),
+        ("s (market)", "cycle market sort: default · price · change · %change · name"),
+        ("c (market)", "cycle market category filter"),
+        ("a (market)", "add a custom ticker (via prompt)"),
+        ("d (market)", "remove selected custom ticker"),
+        ("SPACE", "omnibar — type ticker for live quote + auto-add to Markets"),
         ("s / S", "cycle matrix sort key / flip ascending-descending"),
         ("< > , .", "horizontal scroll wide tables ( [ ] = page)"),
         ("/ or :", "command palette — type country, action or screen"),
@@ -1876,6 +2487,10 @@ def content_renderable(state: TerminalState, app: App, w: int, h: int) -> Render
         return render_audit(state, app, w, h)
     if key == "system":
         return render_system(state, app, w, h)
+    if key == "market":
+        return render_market(state, app, w, h)
+    if key == "papertrade":
+        return render_papertrade(state, app, w, h)
     return Text("")
 
 
@@ -1897,8 +2512,10 @@ def build_screen(state: TerminalState, app: App, cols: int, lines: int) -> Layou
     root["header"].update(render_header(state, app, cols))
     body_h = max(4, lines - 7)                       # 1 tape + 2 header + 4 footer
 
-    # the nav rail shrinks slightly in split mode (Bloomberg squeezes chrome)
-    nav_w = max(16, cols // 6) if state.layout == "hsplit" else max(20, cols // 5)
+    # Dynamic sidebar: expands when focused, shrinks to icons when not
+    nav_w = max(28, cols // 4) if (state.nav_expanded or state.focus == "nav") else max(12, cols // 10)
+    if state.layout == "hsplit":
+        nav_w = max(16, cols // 6)                   # split mode keeps it mid-size
     body = root["body"]
 
     # modal overlays (palette/search/watchlist/help) draw full-width regardless
@@ -1954,6 +2571,10 @@ def sel_max(state: TerminalState, app: App) -> int:
                                     lambda: app.audit_rows(state.audit_imputed_only))) - 1)
     if key == "system":
         return max(0, len(SYSTEM_ACTIONS) - 1)
+    if key == "market":
+        return max(0, len(_market_items(state)) - 1)
+    if key == "papertrade":
+        return max(0, len(app.cache("pt_runs", app.papertrade_runs)) - 1)
     return 0
 
 
@@ -1969,6 +2590,10 @@ def scroll_max(state: TerminalState, app: App) -> int:
                                     lambda: app.audit_rows(state.audit_imputed_only))) - inner)
     if key == "system":
         return max(0, len(SYSTEM_ACTIONS) - inner)
+    if key == "market":
+        return max(0, len(_market_items(state)) - inner)
+    if key == "papertrade":
+        return max(0, len(app.cache("pt_runs", app.papertrade_runs)) - inner)
     return 0
 
 
@@ -1988,6 +2613,15 @@ def h_move(state: TerminalState, app: App, d: int) -> None:
                 state.vscroll = state.policy_sel
             if state.policy_sel >= state.vscroll + inner:
                 state.vscroll = state.policy_sel - inner + 1
+        return
+    if key == "papertrade":                       # backtest list uses papertrade_sel
+        n = len(app.cache("pt_runs", app.papertrade_runs))
+        if n:
+            state.papertrade_sel = max(0, min(state.papertrade_sel + d, n - 1))
+            if state.papertrade_sel < state.vscroll:
+                state.vscroll = state.papertrade_sel
+            if state.papertrade_sel >= state.vscroll + inner:
+                state.vscroll = state.papertrade_sel - inner + 1
         return
     mx = sel_max(state, app)
     state.sel = max(0, min(state.sel + d, mx))
@@ -2039,12 +2673,14 @@ def h_focus_content(state: TerminalState, app: App) -> None:
         state.focus = "content"
     elif state.focus != "content":
         state.focus = "content"
+    state.nav_expanded = False
 
 
 def h_focus_nav(state: TerminalState, app: App) -> None:
     if state.focus == "pane2":
         activate_pane(state, 1)
     state.focus = "nav"
+    state.nav_expanded = True
     if state.mode in ("palette", "search", "watchlist", "help"):
         state.mode = "normal"
 
@@ -2053,15 +2689,18 @@ def h_focus_cycle(state: TerminalState, app: App) -> None:
     """Tab: nav rail → left pane → right pane → nav rail."""
     if state.focus == "nav":
         state.focus = "content"
+        state.nav_expanded = False
     elif state.focus == "content":
         if state.layout == "hsplit":
             activate_pane(state, 2)           # materialize the right pane
             state.focus = "pane2"
         else:
             state.focus = "nav"
+            state.nav_expanded = True
     else:                                       # "pane2" → back to nav rail
         activate_pane(state, 1)
         state.focus = "nav"
+        state.nav_expanded = True
 
 
 def h_enter(state: TerminalState, app: App) -> None:
@@ -2072,9 +2711,12 @@ def h_enter(state: TerminalState, app: App) -> None:
     if key == "matrix" and state.order:
         iso = state.order[state.sel]
         state.sel_iso = iso
-        state.screen = 2                       # Country Deep-Dive
+        state.screen = 2
         app.log_action(f"open {iso}")
         app.toast(f"{iso} deep-dive")
+    elif key == "market":
+        # detail pane is always visible; Enter is a no-op (selection IS the detail)
+        app.toast(f"detail: {state.market_data.get(list(state.market_data.keys())[state.market_sel], {}).get('label', '')}")
     elif key == "audit":
         # rows present: dive into the selected audit row's country
         # table empty:   run the selected ETL quick action instead
@@ -2092,7 +2734,66 @@ def h_enter(state: TerminalState, app: App) -> None:
             title, argv, _d = SYSTEM_ACTIONS[state.sel]
             app.run_job(title, argv)
     elif key == "policy":
-        pass                                      # selection IS the detail pane
+        pass
+
+
+def h_market_sort(state: TerminalState, app: App) -> None:
+    keys = ["default", "px", "chg", "pct", "name"]
+    state.market_sort = keys[(keys.index(state.market_sort) + 1) % len(keys)]
+    app.toast(f"market sort: {state.market_sort}")
+    app.log_action(f"mkt sort {state.market_sort}")
+
+
+def h_market_filter_cycle(state: TerminalState, app: App) -> None:
+    cats = [""] + sorted({t[3] for t in TICKERS})
+    try:
+        idx = cats.index(state.market_filter_cat)
+    except ValueError:
+        idx = 0
+    state.market_filter_cat = cats[(idx + 1) % len(cats)]
+    app.toast(f"market filter: {state.market_filter_cat or 'ALL'}")
+    app.log_action(f"mkt filter {state.market_filter_cat or 'all'}")
+
+
+def h_market_add(state: TerminalState, app: App) -> None:
+    """Prompt for a new ticker via omnibar (a=add mode)."""
+    state.mode = "omni"
+    state.omni_query = ""
+    state._omni_mode = "add_ticker"
+    app.toast("add ticker: type symbol, Enter to add")
+
+
+def h_market_remove(state: TerminalState, app: App) -> None:
+    items = _market_items(state)
+    if not items or state.market_sel >= len(items):
+        return
+    tag, _d = items[state.market_sel]
+    # only allow removing user-added tickers
+    state.market_custom = [t for t in state.market_custom if t[0] != tag]
+    state.market_data.pop(tag, None)
+    if state.market_sel > 0:
+        state.market_sel -= 1
+    app.toast(f"removed {tag}")
+    app.log_action(f"mkt rm {tag}")
+
+
+def _ctx_sort(state: TerminalState, app: App) -> None:
+    if SCREENS[state.screen]["key"] == "market":
+        h_market_sort(state, app)
+    else:
+        h_sort(state, app)
+
+
+def _ctx_filter(state: TerminalState, app: App) -> None:
+    if SCREENS[state.screen]["key"] == "market":
+        h_market_filter_cycle(state, app)
+    elif SCREENS[state.screen]["key"] == "audit":
+        h_audit_filter(state, app)
+    else:
+        app.toast("no filter here")
+
+
+# ── the dispatch table (normal mode) ───────────────────────────────────────
 
 
 def h_screen(state: TerminalState, app: App, idx: int) -> None:
@@ -2458,24 +3159,27 @@ DISPATCH: dict[str, Handler] = {
     ">": lambda s, a: h_hscroll(s, a, +1),
     "[": lambda s, a: h_hscroll(s, a, -1, page=True),
     "]": lambda s, a: h_hscroll(s, a, +1, page=True),
-    "s": h_sort, "S": h_sort_flip,
+    "s": _ctx_sort, "S": h_sort_flip,
     "H": h_heatmap,
     " ": h_omni_focus,
     "W": h_toggle_watch, "w": h_toggle_watch,
     "F9": h_toggle_split,
     "F3": h_workspace_cycle,
     "F4": h_workspace_save,
-    "F": h_audit_filter,
+    "F": _ctx_filter, "c": _ctx_filter,
     "E": h_export,
     "F2": h_watchlist_overlay,
     "?": h_help, "h": h_help,
     "X": lambda s, a: a.kill_job(),
+    "a": h_market_add, "d": h_market_remove,
     "1": lambda s, a: h_screen(s, a, 0),
     "2": lambda s, a: h_screen(s, a, 1),
     "3": lambda s, a: h_screen(s, a, 2),
     "4": lambda s, a: h_screen(s, a, 3),
     "5": lambda s, a: h_screen(s, a, 4),
     "6": lambda s, a: h_screen(s, a, 5),
+    "7": lambda s, a: h_screen(s, a, 6),
+    "8": lambda s, a: h_screen(s, a, 7),
 }
 VIM = {"k": "UP", "j": "DOWN", "K": "PGUP", "J": "PGDN", "g": "TOP", "G": "END"}
 
@@ -2726,7 +3430,14 @@ def make_sig(state: TerminalState, app: App, cols: int, lines: int) -> tuple:
     j = state.job
     job_sig = (j.title, j.rc, len(j.lines), bool(j.running)) if j else (None, None, 0, False)
     mkt = (state.market_live,
-           tuple(sorted((k, v[0], v[1], v[2]) for k, v in state.market_data.items())))
+           state.market_sel,
+           state.market_sort,
+           state.market_filter_cat,
+           state.market_detail,
+           tuple(sorted(state.market_custom)),
+           tuple(sorted((k, v["px"], v["chg"], v["pct"],
+                         len(v.get("history", [])))
+                        for k, v in state.market_data.items())))
     p2 = (state.p2_screen, state.p2_sel, state.p2_sel_iso, state.p2_policy_sel,
           state.p2_sort_key, state.p2_sort_asc, state.p2_hscroll, state.p2_vscroll,
           state.p2_audit_imputed_only)
@@ -2885,19 +3596,52 @@ def _smoke(app: App) -> None:
             state.focus = "nav"
         out.seek(0)
         out.truncate()
-    # tape with a fake snapshot (colours + marquee)
-    state.market_data = {"SPX": (5300.1, +12.3, 0.24), "VIX": (13.4, -0.8, -5.6),
-                         "US10Y": (4.22, 0.01, 0.2), "GOLD": (2550.0, 8.0, 0.3),
-                         "WTI": (82.1, -1.1, -1.3), "BTC": (97000, 1500, 1.6)}
+    # tape with a fake snapshot (colours + marquee) — NEW DICT SCHEMA
+    state.market_data = {
+        "SPX":   {"px": 5300.1, "chg": +12.3, "pct": +0.24, "prev_close": 5287.8,
+                  "open": 5288.0, "day_high": 5310.0, "day_low": 5275.0,
+                  "volume": 2.1e9, "history": [5100, 5150, 5200, 5180, 5250, 5280, 5300],
+                  "ohlc": [{"o":5288,"h":5310,"l":5275,"c":5300,"v":2e9}, {"o":5280,"h":5290,"l":5270,"c":5287,"v":1.8e9}],
+                  "label": "S&P 500", "symbol": "^GSPC", "category": "EQ-IDX", "market_cap": 4.0e13, "ma50": 5200, "ma200": 5000, "high_6m": 5310, "low_6m": 4800},
+        "VIX":   {"px": 13.4, "chg": -0.8, "pct": -5.6, "prev_close": 14.2,
+                  "open": 14.0, "day_high": 14.2, "day_low": 13.1,
+                  "volume": 0, "history": [14, 13.8, 13.6, 13.5, 13.4],
+                  "ohlc": [{"o":14.0,"h":14.2,"l":13.1,"c":13.4,"v":0}],
+                  "label": "Volatility", "symbol": "^VIX", "category": "VOL", "market_cap": 0, "ma50": 14.5, "ma200": 15.0, "high_6m": 20.0, "low_6m": 13.0},
+        "US10Y": {"px": 4.22, "chg": +0.01, "pct": +0.2, "prev_close": 4.21,
+                  "open": 4.21, "day_high": 4.24, "day_low": 4.18,
+                  "volume": 0, "history": [4.18, 4.19, 4.20, 4.21, 4.22],
+                  "ohlc": [{"o":4.21,"h":4.24,"l":4.18,"c":4.22,"v":0}],
+                  "label": "US 10Y Yield", "symbol": "^TNX", "category": "SOV-YLD", "market_cap": 0, "ma50": 4.15, "ma200": 4.05, "high_6m": 4.5, "low_6m": 3.8},
+        "GOLD":  {"px": 2550.0, "chg": +8.0, "pct": +0.3, "prev_close": 2542.0,
+                  "open": 2543.0, "day_high": 2555.0, "day_low": 2540.0,
+                  "volume": 1.5e5, "history": [2500, 2510, 2530, 2545, 2550],
+                  "ohlc": [{"o":2543,"h":2555,"l":2540,"c":2550,"v":1.5e5}],
+                  "label": "Gold", "symbol": "GC=F", "category": "COMMODITY", "market_cap": 0, "ma50": 2450, "ma200": 2300, "high_6m": 2600, "low_6m": 2100},
+        "WTI":   {"px": 82.1, "chg": -1.1, "pct": -1.3, "prev_close": 83.2,
+                  "open": 83.0, "day_high": 83.5, "day_low": 81.8,
+                  "volume": 5e5, "history": [85, 84, 83.5, 82.5, 82.1],
+                  "ohlc": [{"o":83.0,"h":83.5,"l":81.8,"c":82.1,"v":5e5}],
+                  "label": "Crude WTI", "symbol": "CL=F", "category": "COMMODITY", "market_cap": 0, "ma50": 80, "ma200": 75, "high_6m": 95, "low_6m": 70},
+        "BTC":   {"px": 97000, "chg": +1500, "pct": +1.6, "prev_close": 95500,
+                  "open": 95600, "day_high": 97500, "day_low": 95400,
+                  "volume": 3e4, "history": [92000, 93500, 94500, 95500, 97000],
+                  "ohlc": [{"o":95600,"h":97500,"l":95400,"c":97000,"v":3e4}],
+                  "label": "Bitcoin", "symbol": "BTC-USD", "category": "CRYPTO", "market_cap": 1.9e12, "ma50": 90000, "ma200": 70000, "high_6m": 99000, "low_6m": 50000},
+    }
     state.market_live = True
     state.offline = False
     state.layout = "single"
     state.focus = "nav"
+    # also test the new market screen
+    state.screen = 6
     try:
         console.print(build_screen(state, app, 120, 40))
-        print("  feature tape          rendered (live snapshot)")
+        print("  feature market-screen rendered")
     except Exception as e:
-        print(f"  feature tape FAILED: {e}")
+        print(f"  feature market-screen FAILED: {e}")
+    out.seek(0)
+    out.truncate()
     print("\nsmoke complete.")
 
 
