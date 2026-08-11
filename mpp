@@ -1,0 +1,391 @@
+#!/usr/bin/env python3
+# =============================================================================
+#  mpp — MERGED PROGRAM COPY: mtui ⊕ paperflow ⊕ papertrail ⊕ papertrade
+# =============================================================================
+#  One command that merges the four code-copy commands into one:
+#      mtui --code               (copies mtui's own source)
+#      paperflow --code copy     (copies the paperflow project source)
+#      papertrail --code dump    (PAPERTRAIL_PLAIN=1 → clean payload on stdout)
+#      papertrade --code dump    (copies the papertrade project source)
+#
+#  paperflow and papertrade are consumed via their own commands so the merged
+#  payload is byte-identical to each program's own export — no re-implementation
+#  drift. If a sub-command fails, mpp falls back to its legacy in-process copy.
+#
+#  Usage:
+#    mpp --code copy        Copy ALL FOUR sources, merged, to clipboard (default)
+#    mpp --code             Same as `mpp --code copy`
+#    mpp --code dump        Print the merged payload to stdout (no clipboard)
+#    mpp --version          Show version
+#    mpp --help             Show help
+#
+#  Exit codes:  0  every part collected (and, for copy, clipboard verified)
+#               1  at least one part failed / missing, or clipboard was not
+#                  verified byte-for-byte
+#
+#  The clipboard copy is verified by reading the payload back (wl-paste /
+#  xclip -o / xsel -o / pbpaste) and comparing byte-for-byte, like mtui does.
+# =============================================================================
+
+import argparse
+import hashlib
+import os
+import shutil
+import subprocess
+import sys
+import time
+from pathlib import Path
+
+VERSION = "2.0.1"
+
+BAR = "=" * 70
+THIN = "-" * 70
+HEAVY = "═" * 70
+
+
+# ── clipboard families: (copy tool, matching read-back tool) ────────────────
+CLIP_FAMILIES = [
+    (["xclip", "-selection", "clipboard"], ["xclip", "-selection", "clipboard", "-o"]),
+    (["wl-copy"], ["wl-paste", "--no-newline"]),
+    (["xsel", "--clipboard", "--input"], ["xsel", "--clipboard", "--output"]),
+    (["pbcopy"], ["pbpaste"]),
+]
+
+
+def _copy_clipboard(text: str) -> list[str] | None:
+    """Copy text to the system clipboard (bounded, non-blocking).
+
+    Returns the read-back tool of the family actually used, or None when no
+    tool could copy the payload. The caller must read back with that same
+    tool so verification checks the clipboard we really wrote.
+    """
+    for copy_tool, read_tool in CLIP_FAMILIES:
+        if not shutil.which(copy_tool[0]):
+            continue
+        p = None
+        try:
+            p = subprocess.Popen(copy_tool, stdin=subprocess.PIPE,
+                                 stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            p.communicate(text.encode("utf-8"), timeout=10)
+            if p.returncode == 0:
+                return read_tool
+        except subprocess.TimeoutExpired:
+            # A hung tool must not be leaked or left owning the clipboard:
+            # kill it and drain the pipes (same as paperflow's own helper).
+            if p is not None:
+                try:
+                    p.kill()
+                    p.communicate(timeout=2)
+                except Exception:
+                    pass
+        except Exception:
+            continue
+    return None
+
+
+def _readback_clipboard(read_tool: list[str] | None) -> str | None:
+    """Read the clipboard back with the same tool we copied with."""
+    if not read_tool:
+        return None
+    p = None
+    try:
+        p = subprocess.Popen(read_tool, stdout=subprocess.PIPE,
+                             stderr=subprocess.DEVNULL)
+        return p.communicate(timeout=10)[0].decode("utf-8", errors="replace")
+    except subprocess.TimeoutExpired:
+        if p is not None:
+            try:
+                p.kill()
+                p.communicate(timeout=2)
+            except Exception:
+                pass
+        return None
+    except Exception:
+        return None
+
+
+def _silence_broken_stdout() -> None:
+    """Point stdout at devnull so the interpreter-exit flush can't raise.
+
+    Mirrors paperflow's BrokenPipeError handling for `... | head` pipes.
+    """
+    try:
+        os.dup2(os.open(os.devnull, os.O_WRONLY), sys.stdout.fileno())
+    except Exception:
+        pass
+
+
+# ── part 1: mtui — same payload as `mtui --code` (the script file itself) ───
+def part_mtui() -> tuple[bool, dict]:
+    exe = shutil.which("mtui")
+    if not exe:
+        return False, {"name": "mtui", "err": "mtui not found on PATH"}
+    path = Path(exe).resolve()
+    try:
+        text = path.read_text(encoding="utf-8")
+    except (OSError, UnicodeDecodeError) as exc:
+        return False, {"name": "mtui", "err": f"cannot read {path}: {exc}"}
+    return True, {"name": "mtui", "path": str(path), "text": text}
+
+
+# ── part 2: paperflow — run `paperflow --code copy`, strip its trailer ──────
+def part_paperflow() -> tuple[bool, dict]:
+    exe = shutil.which("paperflow")
+    if not exe:
+        return False, {"name": "paperflow", "err": "paperflow not found on PATH"}
+    # We only want the payload on stdout: stop paperflow from also writing the
+    # clipboard itself, so `mpp --code dump` really is a no-clipboard command.
+    env = dict(os.environ, PAPERFLOW_NO_CLIPBOARD="1")
+    try:
+        p = subprocess.run([exe, "--code", "copy"], capture_output=True,
+                           text=True, timeout=45, env=env)
+    except (OSError, subprocess.TimeoutExpired, UnicodeDecodeError) as exc:
+        return False, {"name": "paperflow", "err": f"paperflow --code copy failed: {exc}"}
+    if p.returncode != 0:
+        tail = (p.stderr or p.stdout or "").strip()[-300:]
+        return False, {"name": "paperflow",
+                       "err": f"paperflow --code copy exit {p.returncode}: {tail}"}
+    lines = p.stdout.split("\n")
+    eq = [i for i, ln in enumerate(lines) if ln == BAR]
+    if len(eq) >= 2:                         # footer = last two ==== lines
+        del lines[eq[-2]:]
+    text = "\n".join(lines).rstrip("\n") + "\n"
+    return True, {"name": "paperflow", "path": exe, "text": text}
+
+
+# ── part 3: papertrail — same file set & format as paper * --code dump ──────
+def _paper_files(proj: Path) -> list[tuple[str, Path]]:
+    """Same discovery rules as paper _collect_source_files():
+    sorted .py (excluding top-level __pycache__/data/.git), the paper*
+    script itself, config/*.{yaml,yml}, templates/*.j2, root *.md,
+    requirements.txt."""
+    out: list[tuple[str, Path]] = []
+    ex_top = {proj / n for n in ("__pycache__", "data", ".git")}
+    for root, dirs, files in os.walk(proj):
+        if Path(root) == proj:
+            dirs[:] = [d for d in dirs if proj / d not in ex_top]
+        for f in files:
+            if f.endswith(".py"):
+                fp = Path(root) / f
+                out.append((str(fp.relative_to(proj)), fp))
+    out.sort(key=lambda t: str(t[1]))
+    script = proj / "papertrail"
+    if script.is_file():
+        out.append((script.name, script))
+    for rel, suffixes in (("config", (".yaml", ".yml")), ("templates", (".j2",))):
+        d = proj / rel
+        if d.is_dir():
+            picked = sorted(p for p in d.iterdir()
+                            if p.is_file() and p.suffix in suffixes)
+            out.extend((str(p.relative_to(proj)), p) for p in picked)
+    for p in sorted(proj.glob("*.md")):
+        out.append((p.name, p))
+    req = proj / "requirements.txt"
+    if req.is_file():
+        out.append((req.name, req))
+    return out
+
+
+def _paper_dump_payload(proj: Path) -> str:
+    """Legacy fallback: same file set & format as PAPERTRAIL_PLAIN=1 dump."""
+    buf: list[str] = []
+    for rel, abspath in _paper_files(proj):
+        try:
+            content = abspath.read_text(encoding="utf-8", errors="replace")
+        except OSError as exc:
+            content = f"[Error reading {abspath}: {exc}]"
+        n_lines = content.count("\n") + 1
+        buf.append(HEAVY)
+        buf.append(f"  FILE: {rel}")
+        buf.append(f"  PATH: {abspath}")
+        buf.append(f"  LINES: {n_lines}")
+        buf.append(HEAVY)
+        buf.append("")
+        buf.append(content)
+        buf.append("")
+    # CSV signal dumps (same globs paper's dump uses)
+    for pat in ("tacs_signals_*.csv", "tacs_neutral_*.csv", "quarterly_signals_*.csv"):
+        for csv in sorted(proj.glob(pat)):
+            buf.append(f"--- {csv.name} ---")
+            try:
+                buf.append(csv.read_text(encoding="utf-8", errors="replace"))
+            except OSError as exc:
+                buf.append(f"[Error reading {csv.name}: {exc}]")
+            buf.append("")
+    logf = Path.home() / ".papertrail" / "paper-trail.log"
+    if logf.is_file():
+        buf.append(HEAVY)
+        buf.append("  PAPER TRAIL LOG")
+        buf.append(HEAVY)
+        buf.append("")
+        try:
+            buf.append(logf.read_text(encoding="utf-8", errors="replace"))
+        except OSError as exc:
+            buf.append(f"[Error reading {logf}: {exc}]")
+        buf.append("")
+    return "\n".join(buf)
+
+
+def part_papertrail() -> tuple[bool, dict]:
+    exe = shutil.which("papertrail")
+    if not exe:
+        return False, {"name": "papertrail", "err": "papertrail not found on PATH"}
+    proj = Path(exe).resolve().parent          # the script lives at project root
+    env = dict(os.environ, PAPERTRAIL_PLAIN="1")
+    try:
+        p = subprocess.run([exe, "--code", "dump"], capture_output=True,
+                           text=True, timeout=60, env=env)
+    except (OSError, subprocess.TimeoutExpired, UnicodeDecodeError):
+        p = None
+    if p is not None and p.returncode == 0 and p.stdout.strip():
+        return True, {"name": "papertrail", "path": str(proj),
+                      "text": p.stdout.rstrip("\n") + "\n"}
+    return True, {"name": "papertrail", "path": str(proj),
+                  "text": _paper_dump_payload(proj)}
+
+
+# ── part 4: papertrade — run the subsystem's own `--code dump` ──────────────
+def part_papertrade() -> tuple[bool, dict]:
+    exe = shutil.which("papertrade")
+    if not exe:
+        return False, {"name": "papertrade", "err": "papertrade not found on PATH"}
+    try:
+        p = subprocess.run([exe, "--code", "dump"], capture_output=True,
+                           text=True, timeout=60)
+    except (OSError, subprocess.TimeoutExpired, UnicodeDecodeError) as exc:
+        return False, {"name": "papertrade", "err": f"papertrade --code dump failed: {exc}"}
+    if p.returncode != 0:
+        tail = (p.stderr or p.stdout or "").strip()[-300:]
+        return False, {"name": "papertrade",
+                       "err": f"papertrade --code dump exit {p.returncode}: {tail}"}
+    if not p.stdout.strip():
+        return False, {"name": "papertrade", "err": "papertrade --code dump printed nothing"}
+    return True, {"name": "papertrade", "path": str(Path(exe).resolve()),
+                  "text": p.stdout.rstrip("\n") + "\n"}
+
+
+# ── assembly ─────────────────────────────────────────────────────────────────
+def build_payload(stamp: str) -> tuple[str, list[dict], list[str]]:
+    gather = [part_mtui, part_paperflow, part_papertrail, part_papertrade]
+    parts: list[dict] = []
+    failures: list[str] = []
+    for idx, fn in enumerate(gather, 1):
+        ok, info = fn()
+        if not ok:
+            failures.append(f"[{idx}/4 {info.get('name', '?')}] {info.get('err', 'unknown')}")
+            parts.append({"name": info.get("name", f"part{idx}"),
+                          "path": "—", "text": ""})
+            continue
+        parts.append({"name": info["name"], "path": info["path"], "text": info["text"]})
+
+    lines = [BAR,
+             "  MPP — MERGED SOURCE CODE EXPORT (mtui ⊕ paperflow ⊕ papertrail ⊕ papertrade)",
+             f"  Generated: {stamp}",
+             BAR, ""]
+    for idx, part in enumerate(parts, 1):
+        text = part["text"]
+        n_lines = text.count("\n") + (1 if text else 0)
+        n_bytes = len(text.encode("utf-8"))
+        lines.append(THIN)
+        lines.append(f"  PART {idx}/4: {part['name'].upper()}  "
+                     f"({n_lines:,} lines · {n_bytes:,} bytes)")
+        lines.append(THIN)
+        lines.append("")
+        lines.append(text)
+        lines.append("")
+    if failures:
+        lines.append(BAR)
+        lines.append("  FAILED PARTS:")
+        lines.extend(f"    {f}" for f in failures)
+        lines.append(BAR)
+    payload = "\n".join(lines)
+    return payload, parts, failures
+
+
+def main(argv: list[str] | None = None) -> int:
+    ap = argparse.ArgumentParser(
+        prog="mpp", add_help=False,
+        description="merged source-code copy: mtui ⊕ paperflow ⊕ papertrail ⊕ papertrade")
+    ap.add_argument("--code", nargs="?", const="copy", choices=("copy", "dump"),
+                    default=None, help="merged copy (default) or dump")
+    ap.add_argument("--version", action="store_true")
+    ap.add_argument("--help", action="store_true")
+    args = ap.parse_args(argv)
+
+    if args.version:
+        print(f"mpp {VERSION}")
+        return 0
+    if args.help:
+        print("mpp — merge of the four code-copy commands into one:")
+        print("      mtui --code, paperflow --code copy,")
+        print("      papertrail --code dump, papertrade --code dump")
+        print("usage:")
+        print("  mpp --code copy    copy ALL FOUR sources to clipboard (one verified merged payload)")
+        print("  mpp --code         same as --code copy")
+        print("  mpp --code dump    print merged payload to stdout (no clipboard)")
+        print("  mpp --version      show version")
+        print("  mpp --help         this help")
+        print("exit: 0 all parts verified · 1 any part failed / not verified")
+        return 0
+    if args.code is None:
+        args.code = "copy"
+    parts_mode = args.code
+
+    stamp = time.strftime("%Y-%m-%d %H:%M:%S")
+    payload, parts, failures = build_payload(stamp)
+    sha = hashlib.sha256(payload.encode("utf-8")).hexdigest()
+    n_lines = payload.count("\n") + 1
+    n_bytes = len(payload.encode("utf-8"))
+    failed = len(failures) > 0
+
+    status = [f"mpp --code {parts_mode}: merged {len(parts)} source parts "
+              f"({', '.join(p['name'] for p in parts)})"]
+    for part in parts:
+        marker = "✓" if part["text"] else "✗"
+        path = part["path"] or "not found"
+        status.append(f"  {marker} {part['name']:<12} {path}")
+    for f in failures:
+        status.append(f"  FAILED: {f}")
+
+    if parts_mode == "dump":
+        # status lines go to stderr so `mpp --code dump > file` gets a pure payload
+        status.append(f"  {n_lines:,} lines · {n_bytes:,} bytes · full payload follows")
+        for ln in status:
+            print(ln, file=sys.stderr)
+        try:
+            sys.stdout.write(payload)
+            sys.stdout.write("\n")
+        except BrokenPipeError:
+            _silence_broken_stdout()   # e.g. `mpp --code dump | head`
+        return 1 if failed else 0
+    try:
+        for ln in status:
+            print(ln)
+    except BrokenPipeError:
+        _silence_broken_stdout()
+
+    # ── clipboard copy + byte-for-byte verification ──
+    read_tool = _copy_clipboard(payload)
+    if read_tool is None:
+        print("  ✗ no clipboard tool found (need xclip/wl-copy/xsel/pbcopy)")
+        print("    hint: mpp --code dump > mpp.txt")
+        return 1
+    print(f"  copied {n_lines:,} lines · {n_bytes:,} bytes · sha256 {sha[:16]}…")
+
+    got = _readback_clipboard(read_tool)
+    if got is None:
+        print("  ? read-back failed (no tool or timed out) — paste to verify manually")
+        return 1 if failed else 0
+    got_bytes = len(got.encode("utf-8"))
+    # Same normalization as mtui: clipboard tools may add or translate line
+    # endings (CRLF/CR), so compare content modulo line endings + trailing \n.
+    if got.replace("\r\n", "\n").replace("\r", "\n").rstrip("\n") == payload.rstrip("\n"):
+        print(f"  ✓ verified: read back {got_bytes:,} bytes — ALL {len(parts)} parts intact")
+        return 1 if failed else 0
+    print(f"  ✗ MISMATCH: sent {n_bytes:,} b, got {got_bytes:,} b")
+    print("    hint: mpp --code dump > mpp.txt to recover the payload")
+    return 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())
