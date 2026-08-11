@@ -5,7 +5,7 @@
 ![Python](https://img.shields.io/badge/python-3.11+-blue)
 ![Rich](https://img.shields.io/badge/depends-rich-yellow)
 ![License](https://img.shields.io/badge/license-MIT-green)
-![Lines](https://img.shields.io/badge/single--file-2%2C905%20lines-black)
+![Lines](https://img.shields.io/badge/single--file-3%2C729%20lines-black)
 
 ```text
 ┌────────────────────────────────────────────────────────────────┐
@@ -111,6 +111,33 @@ mtui --help             # usage
 
 - **Paperflow** — the GFCR v6.0 sovereign rating platform → [github.com/higher5951t/paperflow](https://github.com/higher5951t/paperflow)
 - 100% offline-capable (demo seed data bundled in Paperflow)
+
+## 🧩 mpp — merged code-copy command
+
+`mpp` merges the four subsystems' own export commands into one verified payload:
+
+- `mtui --code` · `paperflow --code copy` · `papertrail --code dump` (PAPERTRAIL_PLAIN=1) · `papertrade --code dump`
+
+```bash
+mpp --code copy      # copy ALL FOUR sources, merged, to the clipboard (read-back verified)
+mpp --code dump      # print the merged payload to stdout (no clipboard side effects)
+```
+
+It consumes each subsystem's own command (no re-implementation drift), reads the
+clipboard back with the *same family it wrote to* and compares content
+byte-for-byte (CR/CRLF normalized), and kills hung clipboard tools instead of
+leaking them. See the header of `mpp` for the full contract.
+
+## 🧪 Development
+
+Tests cover the clipboard/export paths of `mpp`, `mtui`, and `papertrade` —
+all stubbed: no clipboard I/O, no subprocesses, no network, PATH-independent.
+
+```bash
+make test        # or: python3 -m unittest discover -s tests -v
+```
+
+CI runs the same command on push/PR (see `.github/workflows/tests.yml`).
 
 ## 📄 License
 

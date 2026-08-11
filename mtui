@@ -2912,27 +2912,47 @@ def h_export(state: TerminalState, app: App) -> None:
         log_error(f"export: {exc}")
         app.toast("export failed — see error.log")
         return
-    copy_clipboard(open(path).read())
+    with open(path, encoding="utf-8") as fh:
+        exported = fh.read()
     msg = f"exported {len(rows) - 1} rows → {path.name}"
-    if copy_clipboard(""):
+    if copy_clipboard(exported):
         msg += " · clipboard"
     app.toast(msg)
     app.log_action(f"export {key}")
 
 
-def copy_clipboard(text: str) -> bool:
-    for tool in (["xclip", "-selection", "clipboard"], ["wl-copy"],
-                 ["xsel", "--clipboard", "--input"], ["pbcopy"]):
-        if not shutil.which(tool[0]):
+def copy_clipboard(text: str) -> list[str] | None:
+    """Copy text to the system clipboard (bounded, non-blocking).
+
+    Returns the read-back tool of the family actually used (so callers can
+    verify the same clipboard we wrote), or None when nothing landed.
+    """
+    for copy_tool, read_tool in ((["xclip", "-selection", "clipboard"],
+                                  ["xclip", "-selection", "clipboard", "-o"]),
+                                 (["wl-copy"], ["wl-paste", "--no-newline"]),
+                                 (["xsel", "--clipboard", "--input"],
+                                  ["xsel", "--clipboard", "--output"]),
+                                 (["pbcopy"], ["pbpaste"])):
+        if not shutil.which(copy_tool[0]):
             continue
+        p = None
         try:
-            p = subprocess.Popen(tool, stdin=subprocess.PIPE,
+            p = subprocess.Popen(copy_tool, stdin=subprocess.PIPE,
                                  stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
             p.communicate(text.encode("utf-8"), timeout=8)
-            return p.returncode == 0     # 0 = the tool really accepted the text
+            if p.returncode == 0:        # 0 = the tool really accepted the text
+                return read_tool
+        except subprocess.TimeoutExpired:
+            # A hung tool must not be leaked or left owning the clipboard.
+            if p is not None:
+                try:
+                    p.kill()
+                    p.communicate(timeout=2)
+                except Exception:
+                    pass
         except Exception:
             continue
-    return False
+    return None
 
 
 def _copy_code() -> int:
@@ -2947,12 +2967,17 @@ def _copy_code() -> int:
     if not src.exists():
         print(f"mtui --code: cannot find source at {src}", file=sys.stderr)
         return 1
-    code = src.read_text(encoding="utf-8")
+    try:
+        code = src.read_text(encoding="utf-8")
+    except (OSError, UnicodeDecodeError) as exc:
+        print(f"mtui --code: cannot read source {src}: {exc}", file=sys.stderr)
+        return 1
     payload = code.encode("utf-8")
     sha = hashlib.sha256(payload).hexdigest()
     n_lines = code.count("\n") + 1
 
-    if not copy_clipboard(code):
+    read_tool = copy_clipboard(code)
+    if read_tool is None:
         print("mtui --code: no clipboard tool found (need xclip/wl-copy/xsel/pbcopy)",
               file=sys.stderr)
         return 1
@@ -2960,22 +2985,20 @@ def _copy_code() -> int:
     print(f"mtui --code: copied {src} to clipboard")
     print(f"  {n_lines} lines · {len(payload):,} bytes · sha256 {sha[:16]}…")
 
-    # ── round-trip verification: paste back with the same clipboard family ──
-    readback: list[str] | None = None
-    for tool in ([["wl-paste", "--no-newline"], ["wl-copy"]],
-                 [["xclip", "-selection", "clipboard", "-o"], ["xclip"]],
-                 [["xsel", "--clipboard", "--output"], ["xsel"]],
-                 [["pbpaste"], ["pbcopy"]]):
-        if shutil.which(tool[1][0]):          # we copied with this family
-            if shutil.which(tool[0][0]):      # its read-back tool exists
-                readback = tool[0]
-            break
-    if readback is None:
-        print("  ✓ copied (no read-back tool installed — paste to verify safely)")
-        return 0
+    # ── round-trip verification: paste back with the same family we copied with ──
+    p = None
     try:
-        p = subprocess.Popen(readback, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+        p = subprocess.Popen(read_tool, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
         got = p.communicate(timeout=8)[0].replace(b"\r\n", b"\n").replace(b"\r", b"\n")
+    except subprocess.TimeoutExpired:
+        if p is not None:
+            try:
+                p.kill()
+                p.communicate(timeout=2)
+            except Exception:
+                pass
+        print("  ? read-back timed out — paste to verify", file=sys.stderr)
+        return 0
     except Exception as exc:
         print(f"  ? read-back unavailable ({exc}) — paste to verify", file=sys.stderr)
         return 0
