@@ -501,7 +501,8 @@ class Job:
     def start(self) -> None:
         self.proc = subprocess.Popen(
             self.cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-            text=True, bufsize=1, cwd=PAPERFLOW_DIR, preexec_fn=os.setsid)
+            text=True, bufsize=1, cwd=PAPERFLOW_DIR, preexec_fn=os.setsid,
+            env={**os.environ, "PYTHONUNBUFFERED": "1"})
         threading.Thread(target=self._pump, daemon=True).start()
 
     def _pump(self) -> None:

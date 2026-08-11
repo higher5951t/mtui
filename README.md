@@ -5,7 +5,7 @@
 ![Python](https://img.shields.io/badge/python-3.11+-blue)
 ![Rich](https://img.shields.io/badge/depends-rich-yellow)
 ![License](https://img.shields.io/badge/license-MIT-green)
-![Lines](https://img.shields.io/badge/single--file-2%2C905%20lines-black)
+![Lines](https://img.shields.io/badge/single--file-3%2C800%20lines-black)
 
 ```text
 ┌────────────────────────────────────────────────────────────────┐
@@ -27,7 +27,7 @@
 
 A single-file, keyboard-driven terminal that reads **Paperflow's SQLite databases** (`data/warehouse/paperflow.db` + `gfcr.db`) and turns the GFCR v6.0 11-module sovereign rating engine into a live, Bloomberg-style workstation:
 
-- **📊 Six screens** — Dashboard, Macro Matrix, Country Deep-Dive, Policy Events, Data Audit, System Control
+- **📊 Eight screens** — Dashboard, Macro Matrix, Country Deep-Dive, Policy Events, Data Audit, System Control, Live Markets, Paper Trade
 - **📈 Live market tape** — S&P 500, VIX, US 10Y, DXY, Gold, WTI, BTC polled every 15s (toggleable `--offline`)
 - **🔍 Global search** — `Ctrl+F` across every Paperflow table; omnibar palette (`/` or `:`) for country/action/screen jumps like `DEU`, `MAT`, `POL`, `DASH`
 - **🗺️ Watchlist** — pin/unpin countries with `W`, deep-dive with `Enter`
@@ -76,6 +76,17 @@ mtui --help             # usage
 
 > Requires an interactive terminal.
 
+## Data status
+
+The `DB:LIVE` header badge means the paperflow warehouse and GFCR databases
+are reachable and readable. Live-mode paperflow (see its README) ingests real
+World Bank / IMF / OECD / PWT / OWID / ITU / UN DESA data; the Data Audit
+screen shows per-indicator provenance (source, fallback, estimated flag) so
+you can always tell `actual` from `estimated`.
+
+> Prior to 2026-08 the shipped warehouse contained demo seed data (`seed_demo`).
+> Live-mode `paperflow --pipeline` replaces it with real API data.
+
 ## 🎹 Keybindings
 
 | Key | Action |
@@ -106,6 +117,8 @@ mtui --help             # usage
 | 3 | **Policy Events** | reform detection + 5y-before/5y-after analysis |
 | 4 | **Data Audit** | provenance grid, imputed-only filter, live ETL control |
 | 5 | **System Control** | run/pipe Paperflow jobs, health/status, Streamlit UI |
+| 6 | **Live Markets** | Yahoo Finance tape, candlestick/MA charts, watchlist, add tickers |
+| 7 | **Paper Trade** | papertrade backtest results, NAV curve, cohort attribution |
 
 ## 🧩 Works with
 
