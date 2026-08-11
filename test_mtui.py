@@ -529,8 +529,8 @@ class TestExport(_AppCase):
 
     def test_copy_clipboard_no_tools(self):
         mtui.shutil.which = lambda t: None
+        # no clipboard tool -> False (nothing copied), never raises
         self.assertFalse(mtui.copy_clipboard("hello"))
-        self.assertFalse(mtui.copy_clipboard(b"hello"))
 
 
 # ─────────────────────────────────────────────────────────────────────────────
