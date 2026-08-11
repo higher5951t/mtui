@@ -554,6 +554,9 @@ class App:
         try:
             raw = json.loads(WATCHLIST_PATH.read_text())
             self.s.watch = {str(x).upper() for x in raw}
+        except FileNotFoundError:
+            # first run: no watchlist file yet is a normal state, not an error
+            self.s.watch = set()
         except (OSError, ValueError, json.JSONDecodeError) as exc:
             log_error(f"watchlist load: {exc}")
             self.s.watch = set()
@@ -759,7 +762,10 @@ class App:
             "ORDER BY indicator_code, year", (iso, *codes))
         out: dict[str, list[tuple[int, float]]] = {}
         for r in rows or []:
-            out.setdefault(r["indicator_code"], []).append((r["year"], r["value"]))
+            v = r["value"]
+            if v is None or (isinstance(v, float) and v != v):  # drop NaN samples
+                continue
+            out.setdefault(r["indicator_code"], []).append((r["year"], v))
         return out
 
     def narrative(self, iso: str) -> str:
@@ -860,7 +866,7 @@ def hum(n) -> str:
 
 
 def pct(v: Optional[float], nd: int = 0) -> str:
-    if v is None:
+    if v is None or v != v:          # None or NaN → em dash, never "nan%"
         return "—"
     return f"{v * 100:.{nd}f}%"
 
@@ -903,7 +909,7 @@ def tier_sort(tier: Optional[str]) -> int:
 
 def score_cell(v: Optional[float]) -> Text:
     """GFCR capacity cell — green/amber/red by the 70/40 bands."""
-    if v is None:
+    if v is None or v != v:          # NaN scores from the pipeline render as —
         return Text("—", style=DIM)
     color = GREEN if v >= SCORE_OK else (YELLOW if v >= SCORE_WARN else RED)
     return Text(f"{v:.1f}", style=color)
@@ -911,7 +917,7 @@ def score_cell(v: Optional[float]) -> Text:
 
 def risk_cell(v: Optional[float], nd: int = 0) -> Text:
     """Risk-form 0-1 cell — red = high vulnerability, green = low risk."""
-    if v is None:
+    if v is None or v != v:          # NaN module risk renders as —
         return Text("—", style=DIM)
     color = GREEN if v < RISK_OK else (YELLOW if v < RISK_WARN else RED)
     return Text(pct(v, nd), style=color)
@@ -944,7 +950,9 @@ def risk_bar(v: Optional[float], width: int = 10) -> Text:
 
 def ci_bar(p05: float, p50: float, p95: float, width: int = 16) -> Text:
     """Uncertainty interval strip: ├───●───┤ style (p05 · p50 · p95)."""
-    if p05 is None or p50 is None or p95 is None or p95 <= p05:
+    if (p05 is None or p50 is None or p95 is None
+            or p05 != p05 or p50 != p50 or p95 != p95   # NaN guard: int(NaN) crashes
+            or p95 <= p05):
         return Text("—", style=DIM)
     lo, hi = min(p05, p95), max(p05, p95)
     rng = max(1e-9, hi - lo)
@@ -1377,9 +1385,10 @@ def render_country(state: TerminalState, app: App, w: int, h: int) -> Renderable
     a.add_row(Text(f"GFCR {score:.1f} / 100" if score is not None else "GFCR —",
                    style=f"bold {'green' if (score or 0) >= SCORE_OK else ('yellow' if (score or 0) >= SCORE_WARN else 'red')}"))
     a.add_row(Text(f"TIER  {tier}", style=tier_color(tier)))
-    a.add_row(ci_bar(p05 or 0, p50 or 0, p95 or 0))
-    a.add_row(Text(f"90% CI  {p05:.1f} ─ {p50:.1f} ─ {p95:.1f}" if p05 is not None else "90% CI —",
-                   style=DIM))
+    ci = [0.0 if (x is None or x != x) else x for x in (p05, p50, p95)]
+    a.add_row(ci_bar(*ci))
+    a.add_row(Text(f"90% CI  {p05:.1f} ─ {p50:.1f} ─ {p95:.1f}" if p05 is not None and p05 == p05
+                   else "90% CI —", style=DIM))
     a.add_row(Text(f"ROUND {rating.get('year') or '—'} · PEER {rating.get('peer_group') or '—'} · "
                    f"S_eff {rating.get('s_eff'):.3f}" if rating.get("s_eff") is not None
                    else f"ROUND {rating.get('year') or '—'}", style=DIM))
@@ -2393,7 +2402,7 @@ def _pane_render(state: TerminalState, app: App, pane: int,
 
 def heat_bg(v: Optional[float]) -> str:
     """Risk → background colour ramp: 0.0 bright green … 1.0 bright red."""
-    if v is None:
+    if v is None or v != v:           # NaN/None → plain cell
         return ""
     if v < 0.15:
         return "on bright_green"
@@ -2442,7 +2451,7 @@ def render_matrix_heatmap(state: TerminalState, app: App, w: int, h: int) -> Ren
                  Text((d["name"] or "")[:13], style=TXT)]
         for _mname, col, _w in page:
             v = d.get(col)
-            if v is None:
+            if v is None or v != v:   # NaN module risk renders as a dot, not "nan"
                 cells.append(Text("·", style="grey30"))
                 continue
             style = "black on bright_cyan" if sel_here else f"black {heat_bg(v)}"
@@ -2752,8 +2761,16 @@ def h_enter(state: TerminalState, app: App) -> None:
         app.log_action(f"open {iso}")
         app.toast(f"{iso} deep-dive")
     elif key == "market":
-        # detail pane is always visible; Enter is a no-op (selection IS the detail)
-        app.toast(f"detail: {state.market_data.get(list(state.market_data.keys())[state.market_sel], {}).get('label', '')}")
+        # detail pane is always visible; Enter is a no-op (selection IS the
+        # detail). Resolve the selected item from the *displayed* list: the
+        # market_data dict is in poll order, so indexing it directly by
+        # market_sel reports the wrong ticker once sort/filter is active.
+        items = _market_items(state)
+        if items and 0 <= state.market_sel < len(items):
+            tag, d = items[state.market_sel]
+            app.toast(f"detail: {d.get('label') or tag}")
+        else:
+            app.toast("no market data yet")
     elif key == "audit":
         # rows present: dive into the selected audit row's country
         # table empty:   run the selected ETL quick action instead
@@ -2805,7 +2822,12 @@ def h_market_remove(state: TerminalState, app: App) -> None:
     if not items or state.market_sel >= len(items):
         return
     tag, _d = items[state.market_sel]
-    # only allow removing user-added tickers
+    # default universe tickers are read-only; only user-added ones may be
+    # removed (previously this popped a default's snapshot and it flickered
+    # out of the table until the next poll).
+    if not any(t[0] == tag for t in state.market_custom):
+        app.toast(f"{tag} is a default ticker — cannot remove")
+        return
     state.market_custom = [t for t in state.market_custom if t[0] != tag]
     state.market_data.pop(tag, None)
     if state.market_sel > 0:
@@ -2912,15 +2934,17 @@ def h_export(state: TerminalState, app: App) -> None:
         log_error(f"export: {exc}")
         app.toast("export failed — see error.log")
         return
-    copy_clipboard(open(path).read())
+    # one copy call only: a second `copy_clipboard("")` probe would overwrite
+    # the clipboard with an empty string and lose the export we just made
+    copied = copy_clipboard(path.read_bytes())
     msg = f"exported {len(rows) - 1} rows → {path.name}"
-    if copy_clipboard(""):
+    if copied:
         msg += " · clipboard"
     app.toast(msg)
     app.log_action(f"export {key}")
 
 
-def copy_clipboard(text: str) -> bool:
+def copy_clipboard(text: str | bytes) -> bool:
     for tool in (["xclip", "-selection", "clipboard"], ["wl-copy"],
                  ["xsel", "--clipboard", "--input"], ["pbcopy"]):
         if not shutil.which(tool[0]):
@@ -2928,7 +2952,8 @@ def copy_clipboard(text: str) -> bool:
         try:
             p = subprocess.Popen(tool, stdin=subprocess.PIPE,
                                  stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-            p.communicate(text.encode("utf-8"), timeout=8)
+            data = text if isinstance(text, bytes) else text.encode("utf-8")
+            p.communicate(data, timeout=8)
             return p.returncode == 0     # 0 = the tool really accepted the text
         except Exception:
             continue
@@ -2960,7 +2985,13 @@ def _copy_code() -> int:
     print(f"mtui --code: copied {src} to clipboard")
     print(f"  {n_lines} lines · {len(payload):,} bytes · sha256 {sha[:16]}…")
 
-    # ── round-trip verification: paste back with the same clipboard family ──
+    return _verify_paste(payload, n_lines)
+
+
+def _verify_paste(payload: bytes, n_lines: int) -> int:
+    """Round-trip clipboard check. Paste the just-copied payload back with the
+    same clipboard family and compare byte-for-byte so a truncated or mangled
+    copy is reported as an error instead of silently succeeding."""
     readback: list[str] | None = None
     for tool in ([["wl-paste", "--no-newline"], ["wl-copy"]],
                  [["xclip", "-selection", "clipboard", "-o"], ["xclip"]],
@@ -2992,6 +3023,119 @@ def _copy_code() -> int:
         print("  ✗ MISMATCH: copied text differs from the source!"
               f" (sent {len(payload):,} b, got {len(got):,} b)", file=sys.stderr)
     return 1
+
+
+def _code_sections(src: str) -> list[tuple[int, int, str]]:
+    """Top-level source sections as 0-based (start, end_exclusive) line slices
+    with a human title, for `mtui --code copy secN`.
+
+    A section boundary is a full-width banner header block
+    (`# ────…` + comment title + `# ────…`); the whole block belongs to the
+    following section and a bare closing banner stays with the preceding one.
+    A header block nested inside the previous block's banner pair (stacked
+    comment headers) merges into that section instead of splitting it.
+    The first open boundary anchors the rest, so every source line from there
+    to EOF lands in exactly one section (concat(sections) == that tail)."""
+    lines = src.splitlines()
+
+    def is_banner(i: int) -> bool:
+        s = lines[i].strip()
+        return len(s) >= 50 and set(s) <= {"#", " ", "─"}
+
+    def next_content(i: int) -> int:
+        j = i + 1
+        while j < len(lines) and (not lines[j].strip() or is_banner(j)):
+            j += 1
+        return j
+
+    def block_end(o: int) -> Optional[int]:
+        """First closing banner after open o, i.e. a banner whose next content
+        line is code (the close of o's header block)."""
+        for j in range(o + 1, len(lines)):
+            if not is_banner(j):
+                continue
+            nxt = next_content(j)
+            if nxt < len(lines) and not lines[nxt].lstrip().startswith("#"):
+                return j
+        return None
+
+    opens: list[int] = []
+    for i in range(len(lines)):
+        if not is_banner(i):
+            continue
+        nxt = next_content(i)
+        if nxt < len(lines) and lines[nxt].lstrip().startswith("#"):
+            if not opens or i > (block_end(opens[-1]) or -1):
+                opens.append(i)
+    if not opens:
+        opens = [0]
+
+    ends = opens[1:] + [len(lines)]
+    secs: list[tuple[int, int, str]] = []
+    for a, b in zip(opens, ends):
+        title = ""
+        for l in lines[a + 1:b]:
+            s = l.strip()
+            if not s:
+                continue
+            if s.startswith("#") and not (len(s) >= 50 and set(s) <= {"#", " ", "─"}):
+                title = s.lstrip("# ").rstrip(".")
+            else:
+                title = title or s[:68]
+            break
+        secs.append((a, b, title))
+    return secs
+
+
+def _parse_section_token(tok: str) -> Optional[int]:
+    """'sec1' / 'SEC1' / '1' → 1; anything else → None."""
+    t = tok.lower()
+    while t.startswith("sec"):
+        t = t[3:]
+    return int(t) if t.isdigit() else None
+
+
+def _section_list() -> int:
+    """`mtui --code copy list`: print the section table without copying."""
+    src = Path(__file__).resolve()
+    code = src.read_text(encoding="utf-8")
+    secs = _code_sections(code)
+    print(f"mtui --code: {len(secs)} top-level sections in {src} (use sec1..sec{len(secs)}):")
+    for i, (a, b, title) in enumerate(secs, 1):
+        print(f"    sec{i:<3} lines {a + 1:>4}-{b:<4} {title}")
+    return 0
+
+
+def _copy_section(n: int) -> int:
+    """`mtui --code copy secN`: copy one top-level source section to the
+    clipboard — banner header, code, and all — with the same hash + round-trip
+    verification as the full-file copy."""
+    src = Path(__file__).resolve()
+    if not src.exists():
+        print(f"mtui --code: cannot find source at {src}", file=sys.stderr)
+        return 1
+    code = src.read_text(encoding="utf-8")
+    secs = _code_sections(code)
+    if not 1 <= n <= len(secs):
+        print(f"mtui --code: section {n} out of range — {len(secs)} sections "
+              f"available (sec1..sec{len(secs)}):", file=sys.stderr)
+        for i, (a, b, title) in enumerate(secs, 1):
+            print(f"    sec{i:<3} lines {a + 1:>4}-{b:<4} {title}", file=sys.stderr)
+        return 2
+    a, b, title = secs[n - 1]
+    block = "\n".join(code.splitlines()[a:b]).rstrip("\n") + "\n"
+    payload = block.encode("utf-8")
+    sha = hashlib.sha256(payload).hexdigest()
+    n_lines = block.count("\n") + 1
+
+    if not copy_clipboard(block):
+        print("mtui --code: no clipboard tool found (need xclip/wl-copy/xsel/pbcopy)",
+              file=sys.stderr)
+        return 1
+
+    print(f"mtui --code: copied section {n}/{len(secs)} to clipboard — {title}")
+    print(f"  {n_lines} lines · {len(payload):,} bytes · sha256 {sha[:16]}…")
+    return _verify_paste(payload, n_lines)
 
 
 def h_refresh(state: TerminalState, app: App) -> None:
@@ -3336,7 +3480,11 @@ def handle_help_mode(state: TerminalState, app: App, key: str) -> None:
 def handle_key(state: TerminalState, app: App, key: Optional[str]) -> None:
     if key is None:
         return
-    key = VIM.get(key, key)
+    # VIM nav aliases only apply in non-typing modes. In the palette, search
+    # and omnibar the letters j/k/g/G/J/K are real input, not movement — an
+    # unconditional remap made "japan" type as "apan".
+    if state.mode not in ("palette", "search", "omni"):
+        key = VIM.get(key, key)
     if state.mode == "palette" or state.mode == "search":
         handle_prompt(state, app, key)
         return
@@ -3517,12 +3665,33 @@ def main() -> None:
         print(f"usage: mtui             launch the terminal (v{VERSION})")
         print("       mtui --version    show version")
         print("       mtui --code       copy mtui's full source code to the clipboard")
+        print("       mtui --code copy secN     copy just one top-level source section")
+        print("                                (sec1, sec2… wherever the banners fall)")
+        print("       mtui --code copy list     list the sections with line ranges")
+        print("       mtui --code copy all      copy all sections (same as --code)")
         print("       mtui --offline    launch without the live market tape")
         return
     if "--version" in args:
         print(f"mtui {VERSION}")
         return
     if "--code" in args:
+        i = args.index("--code")
+        rest = args[i + 1:]
+        if rest and rest[0].lower() == "copy":
+            rest = rest[1:]
+        if rest:
+            tok = rest[0].lower()
+            if tok in ("all", "secall", "whole"):
+                sys.exit(_copy_code())
+            if tok in ("list", "--list"):
+                sys.exit(_section_list())
+            n = _parse_section_token(tok)
+            if n is None:
+                print(f"mtui --code: bad section token {rest[0]!r} — use secN "
+                      f"(sec1…secN), 'all' or 'list'.", file=sys.stderr)
+                _section_list()
+                sys.exit(2)
+            sys.exit(_copy_section(n))
         sys.exit(_copy_code())
     offline = "--offline" in args
 
@@ -3560,7 +3729,9 @@ def main() -> None:
                 app.console = Console(force_terminal=True, highlight=False,
                                       width=cols, height=lines, legacy_windows=False)
                 console = app.console
-            state._vis_h = max(10, lines - 7)      # tape+header+footer budget
+            # scroll budget for list screens: in hsplit each pane is half height
+            full_h = max(10, lines - 7)            # tape+header+footer budget
+            state._vis_h = max(10, full_h // 2) if state.layout == "hsplit" else full_h
             sig = make_sig(state, app, cols, lines)
             if sig != last_sig:
                 try:
