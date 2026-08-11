@@ -1387,8 +1387,10 @@ def render_country(state: TerminalState, app: App, w: int, h: int) -> Renderable
     a.add_row(Text(f"TIER  {tier}", style=tier_color(tier)))
     ci = [0.0 if (x is None or x != x) else x for x in (p05, p50, p95)]
     a.add_row(ci_bar(*ci))
-    a.add_row(Text(f"90% CI  {p05:.1f} ─ {p50:.1f} ─ {p95:.1f}" if p05 is not None and p05 == p05
-                   else "90% CI —", style=DIM))
+    if all(x is not None and x == x for x in (p05, p50, p95)):
+        a.add_row(Text(f"90% CI  {p05:.1f} ─ {p50:.1f} ─ {p95:.1f}", style=DIM))
+    else:
+        a.add_row(Text("90% CI —", style=DIM))
     a.add_row(Text(f"ROUND {rating.get('year') or '—'} · PEER {rating.get('peer_group') or '—'} · "
                    f"S_eff {rating.get('s_eff'):.3f}" if rating.get("s_eff") is not None
                    else f"ROUND {rating.get('year') or '—'}", style=DIM))
